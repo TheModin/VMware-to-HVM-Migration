@@ -119,6 +119,8 @@ C:\Drivers\virtio-win\
 | `-MorpheusUser` | String | No | Morpheus username (used to fetch token if token parameter is absent). |
 | `-MorpheusPassword` | String | No | Morpheus password (used to fetch token if token parameter is absent). |
 | `-MorpheusTargetCloudId`| String | No | Target HVM Cloud ID in Morpheus. |
+| `-MorpheusTargetNetworkId`| String | No | (Optional) Target Network ID in Morpheus. |
+| `-MorpheusTargetStoreId`| String | No | (Optional) Target Storage/Datastore ID in Morpheus. |
 | `-MorpheusSkipSSL` | Switch | No | Bypass self-signed SSL validation on the Morpheus endpoint. |
 | `-MorpheusMigrationTimeoutHours` | Int | No | Max hours to wait for migration completion (Default: `4`). |
 | `-LogPath` | String | No | Path to write script logs on management host (Default: `C:\Windows\Logs\VirtIO-HelperInject`). |

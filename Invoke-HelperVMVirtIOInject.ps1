@@ -63,6 +63,8 @@
 #   MorpheusUser     - Morpheus username (used to obtain token if -MorpheusToken absent)
 #   MorpheusPassword - Morpheus password (used to obtain token if -MorpheusToken absent)
 #   MorpheusTargetCloudId - Morpheus cloud ID of the target HVM cluster (required)
+#   MorpheusTargetNetworkId - (Optional) Morpheus ID of the target network to connect the VM
+#   MorpheusTargetStoreId   - (Optional) Morpheus ID of the target storage/datastore for disk placement
 #   MorpheusSkipSSL  - Switch: skip SSL certificate validation (for self-signed certs)
 #   MorpheusMigrationTimeoutHours - Hours to wait for migration to complete (default 4)
 #
@@ -97,6 +99,8 @@ param(
     [string]$MorpheusUser,
     [string]$MorpheusPassword,
     [string]$MorpheusTargetCloudId,
+    [string]$MorpheusTargetNetworkId,
+    [string]$MorpheusTargetStoreId,
     [switch]$MorpheusSkipSSL,
     [int]$MorpheusMigrationTimeoutHours = 4,
     [string]$LogPath = 'C:\Windows\Logs\VirtIO-HelperInject'
@@ -606,11 +610,30 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
     # --- Step 3: Create migration plan ---
     $planName = "PreppMig-$($TargetVM.Name)-$(Get-Date -Format 'yyyyMMdd-HHmm')"
     Write-Log "Creating Morpheus migration plan '$planName'..."
+    
+    $vmConfig = @{ id = $morphVM.id }
+    if ($MorpheusTargetNetworkId) {
+        if ($MorpheusTargetNetworkId -match '^\d+$') {
+            $vmConfig.targetNetwork = @{ id = [int]$MorpheusTargetNetworkId }
+        } else {
+            $vmConfig.targetNetwork = @{ id = $MorpheusTargetNetworkId }
+        }
+        Write-Log "Adding target network mapping: $MorpheusTargetNetworkId"
+    }
+    if ($MorpheusTargetStoreId) {
+        if ($MorpheusTargetStoreId -match '^\d+$') {
+            $vmConfig.targetStore = @{ id = [int]$MorpheusTargetStoreId }
+        } else {
+            $vmConfig.targetStore = @{ id = $MorpheusTargetStoreId }
+        }
+        Write-Log "Adding target storage mapping: $MorpheusTargetStoreId"
+    }
+
     $planBody = @{
         migration = @{
             name        = $planName
             targetCloud = @{ id = [int]$MorpheusTargetCloudId }
-            vms         = @( @{ id = $morphVM.id } )
+            vms         = @( $vmConfig )
         }
     } | ConvertTo-Json -Depth 5
     $createResp = Invoke-RestMethod -Uri "$baseUri/api/migrations" -Method POST `
@@ -722,7 +745,7 @@ Write-Log "Helper VM      : $HelperVMName"
 Write-Log "VirtIO Path    : $VirtIODriverPath (path as seen from inside the helper VM)"
 Write-Log "OS Folder      : $(if ($GuestOSFolder) { "$GuestOSFolder (override)" } else { '(auto-detect from offline disk)' })"
 Write-Log "Guest Tools    : $(if ($InstallGuestTools) { 'yes' } else { 'no' })"
-Write-Log "Morpheus Mig.  : $(if ($TriggerMorpheusMigration) { "yes -> $MorpheusServer (cloud id: $MorpheusTargetCloudId)" } else { 'no' })"
+Write-Log "Morpheus Mig.  : $(if ($TriggerMorpheusMigration) { "yes -> $MorpheusServer (cloud: $MorpheusTargetCloudId, net: $(if ($MorpheusTargetNetworkId) { $MorpheusTargetNetworkId } else { 'default' }), store: $(if ($MorpheusTargetStoreId) { $MorpheusTargetStoreId } else { 'default' }))" } else { 'no' })"
 Write-Log "Log File       : $LogFile"
 
 Connect-VC

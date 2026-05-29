@@ -53,7 +53,8 @@ sequenceDiagram
 - **Automated Host Alignment**: If the Target VM and the Helper VM are on different ESXi hosts, the script automatically vMotions the Helper VM to the target host to enable VMDK hot-mounting.
 - **Accurate OS Build Detection**: Avoids unreliable vCenter guest metadata. It temporarily mounts the target's offline `SOFTWARE` registry hive to query the actual Windows build number, mapping it precisely to the correct VirtIO driver folder (e.g. Server 2025 vs. 2022).
 - **Offline Registry Remediation**: Sets driver start values directly in the offline control set (`Start=0`), ensuring Windows recognizes the boot devices immediately upon startup.
-- **Pure Local Guest-Tools Staging**: When `-InstallGuestTools` is specified, the script performs a zero-network-hop, local VMDK copy of the guest tools onto the mounted target disk. Once the VM boots, the script executes the installer silently.
+- **Pure Local Guest-Tools Staging**: By default the script performs a zero-network-hop, local VMDK copy of the guest tools onto the mounted target disk. Once the VM boots, the script executes the installer silently. Use `-DoNotInstallGuestTools` to skip this behaviour.
+- **Automatic VMware Tools Removal**: After the VM is successfully migrated to HVM, the script automatically removes VMware Tools from the running HVM instance. It first enables WinRM on the source VM (pre-migration) as the management channel, then post-migration it attempts to install the Morpheus agent (via WinRM) and remove tools via a Morpheus task. If the agent path is unavailable, it falls back to direct `Invoke-Command` over WinRM. Use `-DoNotRemoveVMwareTools` to skip this step entirely.
 - **End-to-End Morpheus HVM Integration**: Gracefully shuts down the prepared VM, connects to the Morpheus REST API (supporting standard auth or secure bearer tokens), creates a migration plan targeting your HVM Cloud, starts it, and polls until import is complete.
 - **Enterprise Safety Nets**: Automatically detects and consolidates target VM snapshots before mounting (required to release file locks on the base disk) and creates a safety rollback snapshot before the first boot test.
 
@@ -110,9 +111,11 @@ C:\Drivers\virtio-win\
 | `-ForceHardStopMin` | Int | No | Minutes to wait for graceful target shutdown before forcing power-off (Default: `10`). |
 | `-SkipSnapshot` | Switch | No | Skip creating the post-injection safety snapshot. |
 | `-DeleteSnapshot` | Switch | No | Delete the safety snapshot after confirmed successful boot. |
-| `-InstallGuestTools` | Switch | No | Copier and installer trigger for VirtIO guest tools on target VM. Requires `-TargetVMUser` / `-TargetVMPassword`. |
-| `-TargetVMUser` | String | No | Local administrator on target VM (Required for `-InstallGuestTools`). |
-| `-TargetVMPassword` | Object | No | Local admin password for target VM (Required for `-InstallGuestTools`). |
+| `-DoNotInstallGuestTools` | Switch | No | Skip the VirtIO guest tools copy and silent install. By default the script copies the tools bundle onto the target disk while it is mounted and runs the installer silently after boot. Specify this switch to disable that behaviour. |
+| `-TargetVMUser` | String | No | Local administrator on target VM (Required unless `-DoNotInstallGuestTools` and `-DoNotRemoveVMwareTools`). |
+| `-TargetVMPassword` | Object | No | Local admin password for target VM (Required unless `-DoNotInstallGuestTools` and `-DoNotRemoveVMwareTools`). |
+| `-DoNotRemoveVMwareTools` | Switch | No | Skip the automatic post-migration VMware Tools removal. By default, when `-TriggerMorpheusMigration` is set, the script enables WinRM on the source VM pre-migration, then after successful migration it removes VMware Tools from the HVM instance via the Morpheus agent (with WinRM direct fallback). Requires `-TargetVMUser` / `-TargetVMPassword`. |
+| `-DoNotEnableRDP` | Switch | No | Skip the automatic Remote Desktop enablement pre-migration. By default, the script enables RDP on the target VM via a VMware guest script before migration so the HVM instance is immediately accessible via Remote Desktop after cutover. |
 | `-TriggerMorpheusMigration` | Switch | No | Shuts down target VM after successful boot verify, then automates Morpheus HVM import. |
 | `-MorpheusServer` | String | No | FQDN or IP of the Morpheus / VM Essentials instance (no `https://`). |
 | `-MorpheusToken` | String | No | Morpheus API bearer token. |
@@ -129,8 +132,8 @@ C:\Drivers\virtio-win\
 
 ## Usage Examples
 
-### 1. Basic Offline Injection & Registry Prep
-Prepares the VM `WIN2022-APP` by injecting drivers and verifying boot. Leaves a safety snapshot behind for manual review.
+### 1. Basic Offline Injection Only (No Guest Tools)
+Prepares the VM `WIN2022-APP` by injecting VirtIO drivers and verifying boot. Guest tools installation is skipped explicitly. Leaves a safety snapshot behind for manual review.
 ```powershell
 .\Invoke-HelperVMVirtIOInject.ps1 `
   -VCServer vcsa.company.local `
@@ -138,11 +141,12 @@ Prepares the VM `WIN2022-APP` by injecting drivers and verifying boot. Leaves a 
   -HelperVMName "HELPER-WIN01" `
   -HelperVMUser "Administrator" `
   -HelperVMPassword "HelperSecurePass!" `
-  -VirtIODriverPath "C:\Drivers\virtio-win"
+  -VirtIODriverPath "C:\Drivers\virtio-win" `
+  -DoNotInstallGuestTools
 ```
 
-### 2. Full Injection, Silently Installing Guest Tools, and Snapshot Cleanup
-Auto-injects VirtIO, installs all Guest Tools (network drivers, balloon service, etc.) silently upon boot, verifies boot, and deletes the safety snapshot automatically.
+### 2. Full Injection with Guest Tools and Snapshot Cleanup
+Auto-injects VirtIO drivers and installs all Guest Tools (network drivers, balloon service, etc.) silently upon boot (default behaviour), verifies boot, and deletes the safety snapshot automatically.
 ```powershell
 .\Invoke-HelperVMVirtIOInject.ps1 `
   -VCServer vcsa.company.local `
@@ -151,7 +155,6 @@ Auto-injects VirtIO, installs all Guest Tools (network drivers, balloon service,
   -HelperVMUser "Administrator" `
   -HelperVMPassword "HelperSecurePass!" `
   -VirtIODriverPath "C:\Drivers\virtio-win" `
-  -InstallGuestTools `
   -TargetVMUser "Administrator" `
   -TargetVMPassword "SqlTargetAdminPass!" `
   -DeleteSnapshot
@@ -167,7 +170,6 @@ This will inject the storage drivers offline, install all guest tools on boot, v
   -HelperVMUser "Administrator" `
   -HelperVMPassword "HelperSecurePass!" `
   -VirtIODriverPath "C:\Drivers\virtio-win" `
-  -InstallGuestTools `
   -TargetVMUser "Administrator" `
   -TargetVMPassword "TargetWebPass!" `
   -DeleteSnapshot `

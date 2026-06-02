@@ -1529,7 +1529,10 @@ function Resolve-MorpheusTargetParameters {
         $poolsResp = Invoke-MorpheusRestMethod `
                          -Uri "$baseUri/api/resource-pools?zoneId=$MorpheusTargetCloudId&max=100" `
                          -Method GET -Headers $headers
-        $pools = $poolsResp.resourcePools | Sort-Object name
+        # Filter to pools that belong to the selected HVM cloud (API can return cross-cloud results)
+        $pools = $poolsResp.resourcePools |
+                 Where-Object { $_.zone.id -eq [int]$MorpheusTargetCloudId } |
+                 Sort-Object name
         if (-not $pools -or $pools.Count -eq 0) {
             $script:MorpheusTargetPoolId = '1'
             Write-Log "No resource pools found for cloud $MorpheusTargetCloudId — defaulting to pool ID 1." -Level WARN

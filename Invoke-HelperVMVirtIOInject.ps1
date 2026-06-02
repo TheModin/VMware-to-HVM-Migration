@@ -1262,27 +1262,93 @@ function Remove-VMwareToolsViaTask {
     $baseUri = "https://$MorpheusServer"
     $taskId = $null
 
-    # Registry-based lookup (avoids slow Win32_Product), with QuietUninstallString
-    # preferred over raw product-code uninstall.
+    # 3-stage removal script that handles the KVM post-migration case where msiexec
+    # returns 1603 due to the VM_CheckRequirements custom action failing because
+    # VMware hardware is no longer present.
+    #
+    # Stage 1 — env var bypass (VIT_MSI_DISABLE_VMX_CHECK): works on some VMware Tools
+    #           versions; cheapest to try first.
+    # Stage 2 — MSI database patch: opens the cached MSI in C:\Windows\Installer via
+    #           COM, removes VM_CheckRequirements from InstallExecuteSequence, then
+    #           re-runs msiexec. Reliable clean uninstall when the cache is intact.
+    # Stage 3 — manual forced cleanup: stops services, deletes files and registry keys
+    #           entirely outside MSI. Used when the installer cache is missing or
+    #           both MSI approaches fail.
     $removalScript = @'
-$regPaths = @(
-    'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
-    'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
-)
-$toolsKey = Get-ChildItem $regPaths -ErrorAction SilentlyContinue |
-    ForEach-Object { Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue } |
-    Where-Object { $_.DisplayName -like 'VMware Tools*' } |
-    Select-Object -First 1
-if (-not $toolsKey) { Write-Output 'VMWARETOOLS_NOT_FOUND'; exit 0 }
-Write-Output "FOUND: $($toolsKey.DisplayName) $($toolsKey.DisplayVersion)"
-$uninstallCmd = if ($toolsKey.QuietUninstallString) { $toolsKey.QuietUninstallString }
-               elseif ($toolsKey.UninstallString)  { "$($toolsKey.UninstallString) /qn /norestart" }
-               else                                { "msiexec.exe /x `"$($toolsKey.PSChildName)`" /qn /norestart" }
-Write-Output "UNINSTALL_CMD: $uninstallCmd"
-$proc = Start-Process -FilePath 'cmd.exe' -ArgumentList "/c $uninstallCmd" -Wait -PassThru
-Write-Output "EXIT: $($proc.ExitCode)"
-if ($proc.ExitCode -eq 0 -or $proc.ExitCode -eq 3010) { Write-Output 'VMWARETOOLS_REMOVED' }
-else { Write-Output "REMOVAL_FAILED:$($proc.ExitCode)"; exit 1 }
+function Remove-VMwareToolsInternal {
+    $regPaths = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+    )
+    $toolsKey = Get-ChildItem $regPaths -ErrorAction SilentlyContinue |
+        ForEach-Object { Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue } |
+        Where-Object { $_.DisplayName -like 'VMware Tools*' } |
+        Select-Object -First 1
+    if (-not $toolsKey) { Write-Output 'VMWARETOOLS_NOT_FOUND'; return }
+    Write-Output "FOUND: $($toolsKey.DisplayName) $($toolsKey.DisplayVersion)"
+    $productCode = $toolsKey.PSChildName
+
+    # Stage 1: set env var to bypass VMX hardware check
+    [System.Environment]::SetEnvironmentVariable('VIT_MSI_DISABLE_VMX_CHECK', '1', 'Machine')
+    $p = Start-Process msiexec.exe -ArgumentList "/x $productCode /qn /norestart" -Wait -PassThru -NoNewWindow
+    Write-Output "STAGE1_EXIT: $($p.ExitCode)"
+    if ($p.ExitCode -eq 0 -or $p.ExitCode -eq 3010) { Write-Output 'VMWARETOOLS_REMOVED'; return }
+
+    # Stage 2: patch the cached MSI — remove VM_CheckRequirements from InstallExecuteSequence
+    Write-Output "Stage 1 returned $($p.ExitCode) — attempting MSI database patch..."
+    $msiPath = $null
+    try {
+        $installer = New-Object -ComObject WindowsInstaller.Installer
+        foreach ($c in (Get-ChildItem 'C:\Windows\Installer' -Filter '*.msi' -ErrorAction SilentlyContinue)) {
+            try {
+                $db = $installer.OpenDatabase($c.FullName, 0)
+                $v  = $db.OpenView("SELECT Value FROM Property WHERE Property='ProductName'")
+                $v.Execute()
+                $r  = $v.Fetch()
+                if ($r -and ($r.StringData(1) -like 'VMware Tools*')) { $msiPath = $c.FullName; break }
+            } catch {}
+        }
+    } catch { Write-Output "COM installer unavailable: $_" }
+
+    if ($msiPath) {
+        Write-Output "Found cached MSI: $msiPath"
+        $patched = $false
+        try {
+            $ins2  = New-Object -ComObject WindowsInstaller.Installer
+            $db2   = $ins2.OpenDatabase($msiPath, 1)
+            $view2 = $db2.OpenView("DELETE FROM InstallExecuteSequence WHERE Action='VM_CheckRequirements'")
+            $view2.Execute()
+            $db2.Commit()
+            Write-Output 'MSI patched: VM_CheckRequirements removed'
+            $patched = $true
+        } catch { Write-Output "MSI patch failed: $_" }
+        if ($patched) {
+            $p2 = Start-Process msiexec.exe -ArgumentList "/x $productCode /qn /norestart" -Wait -PassThru -NoNewWindow
+            Write-Output "STAGE2_EXIT: $($p2.ExitCode)"
+            if ($p2.ExitCode -eq 0 -or $p2.ExitCode -eq 3010) { Write-Output 'VMWARETOOLS_REMOVED'; return }
+            Write-Output "Stage 2 returned $($p2.ExitCode) — falling back to manual removal"
+        }
+    } else { Write-Output 'Cached MSI not found — falling back to manual removal' }
+
+    # Stage 3: manual forced cleanup (bypasses MSI entirely)
+    Write-Output 'Starting manual VMware Tools cleanup...'
+    foreach ($svc in @('VMTools', 'VGAuthService', 'vmvss', 'VMwareCAFCommAmqpListener', 'VMwareCAFManagementAgentHost')) {
+        Stop-Service $svc -Force -ErrorAction SilentlyContinue
+        & sc.exe delete $svc 2>&1 | Out-Null
+    }
+    $vmDir = 'C:\Program Files\VMware'
+    if (Test-Path $vmDir) { Remove-Item $vmDir -Recurse -Force -ErrorAction SilentlyContinue; Write-Output "Deleted: $vmDir" }
+    foreach ($regKey in @(
+        'HKLM:\SOFTWARE\VMware, Inc.',
+        'HKLM:\SOFTWARE\WOW6432Node\VMware, Inc.',
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\$productCode",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\$productCode"
+    )) {
+        if (Test-Path $regKey) { Remove-Item $regKey -Recurse -Force -ErrorAction SilentlyContinue; Write-Output "Removed: $regKey" }
+    }
+    Write-Output 'VMWARETOOLS_REMOVED_MANUAL'
+}
+Remove-VMwareToolsInternal
 '@
     try {
         Write-Log "Creating Morpheus task for VMware Tools removal on instance $InstanceId..."
@@ -1314,7 +1380,7 @@ else { Write-Output "REMOVAL_FAILED:$($proc.ExitCode)"; exit 1 }
                 $exStatus = $resultResp.execution.status
                 $output   = $resultResp.execution.output
                 Write-Log "Task execution status: $exStatus output: $output"
-                if ($exStatus -eq 'success' -or ($output -match 'VMWARETOOLS_REMOVED|VMWARETOOLS_NOT_FOUND')) {
+                if ($exStatus -eq 'success' -or ($output -match 'VMWARETOOLS_REMOVED|VMWARETOOLS_REMOVED_MANUAL|VMWARETOOLS_NOT_FOUND')) {
                     Write-Log "VMware Tools removal via Morpheus task succeeded on instance $InstanceId." -Level SUCCESS
                     return
                 }
@@ -1385,28 +1451,87 @@ function Remove-VMwareToolsViaWinRM {
 
         try {
             Write-Log "WinRM session established. Running VMware Tools removal script on $TargetIP..."
-            $result = Invoke-Command -Session $session -ScriptBlock {
-                $regPaths = @(
-                    'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
-                    'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
-                )
-                $toolsKey = Get-ChildItem $regPaths -ErrorAction SilentlyContinue |
-                    ForEach-Object { Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue } |
-                    Where-Object { $_.DisplayName -like 'VMware Tools*' } |
-                    Select-Object -First 1
-                if (-not $toolsKey) { return 'VMWARETOOLS_NOT_FOUND' }
-                $uninstallCmd = if ($toolsKey.QuietUninstallString) { $toolsKey.QuietUninstallString }
-                               elseif ($toolsKey.UninstallString)  { "$($toolsKey.UninstallString) /qn /norestart" }
-                               else                                { "msiexec.exe /x `"$($toolsKey.PSChildName)`" /qn /norestart" }
-                $proc = Start-Process -FilePath 'cmd.exe' -ArgumentList "/c $uninstallCmd" -Wait -PassThru
-                if ($proc.ExitCode -eq 0 -or $proc.ExitCode -eq 3010) { return "VMWARETOOLS_REMOVED:$($proc.ExitCode)" }
-                return "REMOVAL_FAILED:$($proc.ExitCode)"
-            }
-            Write-Log "VMware Tools removal result: $result"
-            if ($result -match 'VMWARETOOLS_REMOVED|VMWARETOOLS_NOT_FOUND') {
+            # Same 3-stage script used by the Morpheus task path — define once, run remotely.
+            $vmRemovalScript = @'
+function Remove-VMwareToolsInternal {
+    $regPaths = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+    )
+    $toolsKey = Get-ChildItem $regPaths -ErrorAction SilentlyContinue |
+        ForEach-Object { Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue } |
+        Where-Object { $_.DisplayName -like 'VMware Tools*' } |
+        Select-Object -First 1
+    if (-not $toolsKey) { Write-Output 'VMWARETOOLS_NOT_FOUND'; return }
+    Write-Output "FOUND: $($toolsKey.DisplayName) $($toolsKey.DisplayVersion)"
+    $productCode = $toolsKey.PSChildName
+
+    [System.Environment]::SetEnvironmentVariable('VIT_MSI_DISABLE_VMX_CHECK', '1', 'Machine')
+    $p = Start-Process msiexec.exe -ArgumentList "/x $productCode /qn /norestart" -Wait -PassThru -NoNewWindow
+    Write-Output "STAGE1_EXIT: $($p.ExitCode)"
+    if ($p.ExitCode -eq 0 -or $p.ExitCode -eq 3010) { Write-Output 'VMWARETOOLS_REMOVED'; return }
+
+    Write-Output "Stage 1 returned $($p.ExitCode) — attempting MSI database patch..."
+    $msiPath = $null
+    try {
+        $installer = New-Object -ComObject WindowsInstaller.Installer
+        foreach ($c in (Get-ChildItem 'C:\Windows\Installer' -Filter '*.msi' -ErrorAction SilentlyContinue)) {
+            try {
+                $db = $installer.OpenDatabase($c.FullName, 0)
+                $v  = $db.OpenView("SELECT Value FROM Property WHERE Property='ProductName'")
+                $v.Execute()
+                $r  = $v.Fetch()
+                if ($r -and ($r.StringData(1) -like 'VMware Tools*')) { $msiPath = $c.FullName; break }
+            } catch {}
+        }
+    } catch { Write-Output "COM installer unavailable: $_" }
+
+    if ($msiPath) {
+        Write-Output "Found cached MSI: $msiPath"
+        $patched = $false
+        try {
+            $ins2  = New-Object -ComObject WindowsInstaller.Installer
+            $db2   = $ins2.OpenDatabase($msiPath, 1)
+            $view2 = $db2.OpenView("DELETE FROM InstallExecuteSequence WHERE Action='VM_CheckRequirements'")
+            $view2.Execute()
+            $db2.Commit()
+            Write-Output 'MSI patched: VM_CheckRequirements removed'
+            $patched = $true
+        } catch { Write-Output "MSI patch failed: $_" }
+        if ($patched) {
+            $p2 = Start-Process msiexec.exe -ArgumentList "/x $productCode /qn /norestart" -Wait -PassThru -NoNewWindow
+            Write-Output "STAGE2_EXIT: $($p2.ExitCode)"
+            if ($p2.ExitCode -eq 0 -or $p2.ExitCode -eq 3010) { Write-Output 'VMWARETOOLS_REMOVED'; return }
+            Write-Output "Stage 2 returned $($p2.ExitCode) — falling back to manual removal"
+        }
+    } else { Write-Output 'Cached MSI not found — falling back to manual removal' }
+
+    Write-Output 'Starting manual VMware Tools cleanup...'
+    foreach ($svc in @('VMTools', 'VGAuthService', 'vmvss', 'VMwareCAFCommAmqpListener', 'VMwareCAFManagementAgentHost')) {
+        Stop-Service $svc -Force -ErrorAction SilentlyContinue
+        & sc.exe delete $svc 2>&1 | Out-Null
+    }
+    $vmDir = 'C:\Program Files\VMware'
+    if (Test-Path $vmDir) { Remove-Item $vmDir -Recurse -Force -ErrorAction SilentlyContinue; Write-Output "Deleted: $vmDir" }
+    foreach ($regKey in @(
+        'HKLM:\SOFTWARE\VMware, Inc.',
+        'HKLM:\SOFTWARE\WOW6432Node\VMware, Inc.',
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\$productCode",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\$productCode"
+    )) {
+        if (Test-Path $regKey) { Remove-Item $regKey -Recurse -Force -ErrorAction SilentlyContinue; Write-Output "Removed: $regKey" }
+    }
+    Write-Output 'VMWARETOOLS_REMOVED_MANUAL'
+}
+Remove-VMwareToolsInternal
+'@
+            $result = Invoke-Command -Session $session -ScriptBlock ([scriptblock]::Create($vmRemovalScript))
+            $resultText = if ($result -is [array]) { $result -join '; ' } else { "$result" }
+            Write-Log "VMware Tools removal result: $resultText"
+            if ($result -match 'VMWARETOOLS_REMOVED|VMWARETOOLS_REMOVED_MANUAL|VMWARETOOLS_NOT_FOUND') {
                 Write-Log "VMware Tools removal via WinRM succeeded on $TargetIP." -Level SUCCESS
             } else {
-                Write-Log "VMware Tools removal may not have completed on ${TargetIP}: $result" -Level WARN
+                Write-Log "VMware Tools removal may not have completed on ${TargetIP}: $resultText" -Level WARN
             }
         } finally {
             Remove-PSSession -Session $session -ErrorAction SilentlyContinue

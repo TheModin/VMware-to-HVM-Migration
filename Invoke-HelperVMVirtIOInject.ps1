@@ -1495,16 +1495,21 @@ function Resolve-MorpheusTargetParameters {
 
     # --- Cloud (zone) ---
     if (-not $MorpheusTargetCloudId) {
-        Write-Log "No -MorpheusTargetCloudId specified — querying available clouds..."
+        Write-Log "No -MorpheusTargetCloudId specified — querying available HVM/KVM clouds..."
         $zonesResp = Invoke-MorpheusRestMethod -Uri "$baseUri/api/zones?max=100" `
                          -Method GET -Headers $headers
-        $clouds = $zonesResp.zones | Sort-Object name
+        # Exclude VMware vCenter source clouds — only offer HVM/KVM targets
+        $vmwareCodes = @('vmware', 'vsphere')
+        $clouds = $zonesResp.zones |
+                  Where-Object { $vmwareCodes -notcontains $_.zoneType.code } |
+                  Sort-Object name
         if (-not $clouds -or $clouds.Count -eq 0) {
-            throw "No Morpheus clouds found. Specify -MorpheusTargetCloudId manually."
+            throw ("No HVM/KVM target clouds found in Morpheus. " +
+                   "Verify that an HVM cloud is configured, or specify -MorpheusTargetCloudId manually.")
         }
         if ($clouds.Count -eq 1) {
             $script:MorpheusTargetCloudId = [string]$clouds[0].id
-            Write-Log "Auto-selected only available cloud: $($clouds[0].name) (id=$($script:MorpheusTargetCloudId))" -Level SUCCESS
+            Write-Log "Auto-selected only available HVM cloud: $($clouds[0].name) (id=$($script:MorpheusTargetCloudId))" -Level SUCCESS
         } else {
             $selected = Select-FromList -Items $clouds -Prompt "Select target Morpheus cloud:" -DisplayScript {
                 param($z) "$($z.id): $($z.name) [$($z.zoneType.name)]"

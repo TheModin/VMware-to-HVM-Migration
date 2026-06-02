@@ -742,6 +742,8 @@ function Invoke-MorpheusRestMethod {
     # Thin wrapper around Invoke-RestMethod that injects SkipCertificateCheck
     # when $MorpheusSkipSSL is set. Defined at script scope so all Morpheus
     # helper functions can share it without nesting.
+    # On first SSL failure the function automatically sets $script:MorpheusSkipSSL
+    # and retries, so self-signed certs work without requiring the flag explicitly.
     param(
         [Parameter(Mandatory)][string]$Uri,
         [ValidateSet('GET','POST','PUT','PATCH','DELETE')][string]$Method = 'GET',
@@ -758,7 +760,20 @@ function Invoke-MorpheusRestMethod {
         $invokeParams.SkipCertificateCheck = $true
     }
 
-    return Invoke-RestMethod @invokeParams
+    try {
+        return Invoke-RestMethod @invokeParams
+    } catch {
+        # Auto-detect SSL certificate errors and retry once with cert check disabled.
+        # This avoids requiring -MorpheusSkipSSL explicitly for self-signed cert environments.
+        $isCertError = $_.Exception.Message -match 'certificate|UntrustedRoot|RemoteCertificate|SSL'
+        if ($isCertError -and -not $MorpheusSkipSSL) {
+            Write-Log "SSL certificate validation failed — enabling SkipCertificateCheck for this session and retrying. Pass -MorpheusSkipSSL to suppress this message." -Level WARN
+            $script:MorpheusSkipSSL = $true
+            $invokeParams.SkipCertificateCheck = $true
+            return Invoke-RestMethod @invokeParams
+        }
+        throw
+    }
 }
 
 function Get-MorpheusAuthHeaders {

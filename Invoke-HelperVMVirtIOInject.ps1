@@ -93,11 +93,11 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$VCServer,
-    [Parameter(Mandatory)][string]$TargetVMName,
-    [Parameter(Mandatory)][string]$HelperVMName,
+    [string]$TargetVMName = '',
+    [string]$HelperVMName = '',
     [Parameter(Mandatory)][string]$HelperVMUser,
     [Parameter(Mandatory)][object]$HelperVMPassword,
-    [Parameter(Mandatory)][string]$VirtIODriverPath,
+    [string]$VirtIODriverPath = '',
     [ValidateSet('2k25','2k22','2k19','2k16','2k12R2','w11','w10')][string]$GuestOSFolder = '',  # blank = auto-detect from offline SOFTWARE hive on the target disk
     [string]$SnapshotName = 'Pre-VirtIO-Injection',
     [int]$ForceHardStopMin = 10,
@@ -172,14 +172,11 @@ if ($MigrationOnly -and -not $TriggerMorpheusMigration) {
 
 if ($TriggerMorpheusMigration) {
     if (-not $MorpheusServer)        { throw '-MorpheusServer is required when -TriggerMorpheusMigration is specified.' }
-    if (-not $MorpheusTargetCloudId) { throw '-MorpheusTargetCloudId is required when -TriggerMorpheusMigration is specified.' }
     if (-not $MorpheusToken -and (-not $MorpheusUser -or -not $MorpheusPassword)) {
         throw 'Either -MorpheusToken or both -MorpheusUser and -MorpheusPassword are required with -TriggerMorpheusMigration.'
     }
-    if (-not $MorpheusTargetPoolId) {
-        $MorpheusTargetPoolId = '1'
-        Write-Warning '-MorpheusTargetPoolId not specified; defaulting to pool ID 1.'
-    }
+    # $MorpheusTargetCloudId, $MorpheusTargetNetworkId, $MorpheusTargetPoolId, and
+    # $MorpheusTargetStoreId are resolved interactively if not provided (see Resolve-MorpheusTargetParameters).
 }
 
 Set-StrictMode -Version Latest
@@ -1453,18 +1450,240 @@ try {
     return $folder
 }
 
+function Select-FromList {
+    # Displays a numbered console menu and returns the selected item.
+    # Items is an array of any objects; DisplayScript formats each one for display.
+    # Loops until a valid number is entered.
+    param(
+        [Parameter(Mandatory)][array]$Items,
+        [Parameter(Mandatory)][string]$Prompt,
+        [Parameter(Mandatory)][scriptblock]$DisplayScript
+    )
+
+    Write-Host ""
+    Write-Host "  $Prompt" -ForegroundColor Cyan
+    Write-Host "  $('─' * [Math]::Min($Prompt.Length, 72))" -ForegroundColor DarkCyan
+    for ($i = 0; $i -lt $Items.Count; $i++) {
+        $display = & $DisplayScript $Items[$i]
+        Write-Host ("  {0,3}. {1}" -f ($i + 1), $display)
+    }
+    Write-Host ""
+    while ($true) {
+        $raw = (Read-Host "  Enter number (1-$($Items.Count))").Trim()
+        if ($raw -match '^\d+$') {
+            $idx = [int]$raw - 1
+            if ($idx -ge 0 -and $idx -lt $Items.Count) {
+                Write-Host ""
+                return $Items[$idx]
+            }
+        }
+        Write-Host "  Invalid selection — please enter a number between 1 and $($Items.Count)." -ForegroundColor Yellow
+    }
+}
+
+function Resolve-MorpheusTargetParameters {
+    # Queries the Morpheus API to present interactive selection menus for any unspecified
+    # target parameters: cloud, resource pool, network, and datastore.
+    # Only called when -TriggerMorpheusMigration is set.
+    # Assigns discovered values directly to the script-scope parameter variables.
+
+    if (-not $TriggerMorpheusMigration) { return }
+
+    Write-Log "Resolving Morpheus target parameters..."
+    $baseUri = "https://$MorpheusServer"
+    $headers = Get-MorpheusAuthHeaders
+
+    # --- Cloud (zone) ---
+    if (-not $MorpheusTargetCloudId) {
+        Write-Log "No -MorpheusTargetCloudId specified — querying available clouds..."
+        $zonesResp = Invoke-MorpheusRestMethod -Uri "$baseUri/api/zones?max=100" `
+                         -Method GET -Headers $headers
+        $clouds = $zonesResp.zones | Sort-Object name
+        if (-not $clouds -or $clouds.Count -eq 0) {
+            throw "No Morpheus clouds found. Specify -MorpheusTargetCloudId manually."
+        }
+        if ($clouds.Count -eq 1) {
+            $script:MorpheusTargetCloudId = [string]$clouds[0].id
+            Write-Log "Auto-selected only available cloud: $($clouds[0].name) (id=$($script:MorpheusTargetCloudId))" -Level SUCCESS
+        } else {
+            $selected = Select-FromList -Items $clouds -Prompt "Select target Morpheus cloud:" -DisplayScript {
+                param($z) "$($z.id): $($z.name) [$($z.zoneType.name)]"
+            }
+            $script:MorpheusTargetCloudId = [string]$selected.id
+            Write-Log "Selected Morpheus cloud: $($selected.name) (id=$($script:MorpheusTargetCloudId))"
+        }
+    }
+
+    if (-not $MorpheusTargetCloudId) {
+        throw "-MorpheusTargetCloudId could not be resolved. Specify it explicitly."
+    }
+
+    # --- Resource pool ---
+    if (-not $MorpheusTargetPoolId) {
+        Write-Log "No -MorpheusTargetPoolId specified — querying resource pools for cloud $MorpheusTargetCloudId..."
+        $poolsResp = Invoke-MorpheusRestMethod `
+                         -Uri "$baseUri/api/resource-pools?zoneId=$MorpheusTargetCloudId&max=100" `
+                         -Method GET -Headers $headers
+        $pools = $poolsResp.resourcePools | Sort-Object name
+        if (-not $pools -or $pools.Count -eq 0) {
+            $script:MorpheusTargetPoolId = '1'
+            Write-Log "No resource pools found for cloud $MorpheusTargetCloudId — defaulting to pool ID 1." -Level WARN
+        } elseif ($pools.Count -eq 1) {
+            $script:MorpheusTargetPoolId = [string]$pools[0].id
+            Write-Log "Auto-selected only available pool: $($pools[0].name) (id=$($script:MorpheusTargetPoolId))" -Level SUCCESS
+        } else {
+            $selected = Select-FromList -Items $pools -Prompt "Select target resource pool:" -DisplayScript {
+                param($p) "$($p.id): $($p.name)"
+            }
+            $script:MorpheusTargetPoolId = [string]$selected.id
+            Write-Log "Selected resource pool: $($selected.name) (id=$($script:MorpheusTargetPoolId))"
+        }
+    }
+
+    # --- Network ---
+    if (-not $MorpheusTargetNetworkId) {
+        Write-Log "No -MorpheusTargetNetworkId specified — querying networks for cloud $MorpheusTargetCloudId..."
+        $netsResp = Invoke-MorpheusRestMethod `
+                        -Uri "$baseUri/api/networks?zoneId=$MorpheusTargetCloudId&max=100" `
+                        -Method GET -Headers $headers
+        $nets = $netsResp.networks | Sort-Object name
+        if (-not $nets -or $nets.Count -eq 0) {
+            Write-Log "No networks found for cloud $MorpheusTargetCloudId — migration will use default network." -Level WARN
+        } elseif ($nets.Count -eq 1) {
+            $script:MorpheusTargetNetworkId = [string]$nets[0].id
+            Write-Log "Auto-selected only available network: $($nets[0].name) (id=$($script:MorpheusTargetNetworkId))" -Level SUCCESS
+        } else {
+            $selected = Select-FromList -Items $nets -Prompt "Select target network:" -DisplayScript {
+                param($n) "$($n.id): $($n.name)"
+            }
+            $script:MorpheusTargetNetworkId = [string]$selected.id
+            Write-Log "Selected network: $($selected.name) (id=$($script:MorpheusTargetNetworkId))"
+        }
+    }
+
+    # --- Datastore ---
+    if (-not $MorpheusTargetStoreId) {
+        Write-Log "No -MorpheusTargetStoreId specified — querying datastores for cloud $MorpheusTargetCloudId..."
+        $storeResp = Invoke-MorpheusRestMethod `
+                         -Uri "$baseUri/api/datastores?zoneId=$MorpheusTargetCloudId&max=100" `
+                         -Method GET -Headers $headers
+        $stores = $storeResp.datastores | Sort-Object name
+        if (-not $stores -or $stores.Count -eq 0) {
+            Write-Log "No datastores found for cloud $MorpheusTargetCloudId — using default storage." -Level WARN
+        } elseif ($stores.Count -eq 1) {
+            $script:MorpheusTargetStoreId = [string]$stores[0].id
+            Write-Log "Auto-selected only available datastore: $($stores[0].name) (id=$($script:MorpheusTargetStoreId))" -Level SUCCESS
+        } else {
+            $selected = Select-FromList -Items $stores -Prompt "Select target datastore (disk placement):" -DisplayScript {
+                param($d)
+                $free = if ($d.PSObject.Properties['freeSpace'] -and $d.freeSpace) {
+                    " — $([math]::Round($d.freeSpace / 1GB, 1)) GB free"
+                } else { '' }
+                "$($d.id): $($d.name)$free"
+            }
+            $script:MorpheusTargetStoreId = [string]$selected.id
+            Write-Log "Selected datastore: $($selected.name) (id=$($script:MorpheusTargetStoreId))"
+        }
+    }
+}
+
+function Resolve-VCenterTargetParameters {
+    # Queries vCenter to present interactive selection menus for any unspecified
+    # VM parameters: TargetVMName, HelperVMName, and VirtIODriverPath.
+    # Must be called after Connect-VC.
+    # Assigns discovered values directly to the script-scope parameter variables.
+
+    # --- Target VM ---
+    if (-not $TargetVMName) {
+        Write-Log "No -TargetVMName specified — querying vCenter for available VMs..."
+        $allVMs = Get-VM | Where-Object {
+            $_.ExtensionData.Config.GuestId -like '*windows*' -or
+            $_.Guest.OSFullName -like '*Windows*'
+        } | Sort-Object Name
+        if (-not $allVMs -or $allVMs.Count -eq 0) {
+            $allVMs = Get-VM | Sort-Object Name
+        }
+        if (-not $allVMs -or $allVMs.Count -eq 0) {
+            throw "No VMs found in vCenter. Specify -TargetVMName manually."
+        }
+        $selected = Select-FromList -Items @($allVMs) -Prompt "Select VM to migrate:" -DisplayScript {
+            param($v) "$($v.Name)  [$($v.PowerState)]  $($v.Guest.OSFullName)  [host: $($v.VMHost.Name)]"
+        }
+        $script:TargetVMName = $selected.Name
+        Write-Log "Selected target VM: $($script:TargetVMName)"
+    }
+
+    # HelperVMName and VirtIODriverPath not needed for MigrationOnly runs
+    if ($MigrationOnly) { return }
+
+    # --- Helper VM ---
+    if (-not $HelperVMName) {
+        Write-Log "No -HelperVMName specified — querying vCenter for available helper VMs..."
+        # Resolve the target VM's ESXi host so same-host VMs sort first
+        $targetVMObj = Get-VM -Name $TargetVMName -ErrorAction SilentlyContinue
+        $targetHostName = if ($targetVMObj) { $targetVMObj.VMHost.Name } else { '' }
+
+        $candidates = Get-VM | Where-Object {
+            $_.Name -ne $TargetVMName -and (
+                $_.ExtensionData.Config.GuestId -like '*windows*' -or
+                $_.Guest.OSFullName -like '*Windows*'
+            )
+        } | Sort-Object @{ Expression = { $_.VMHost.Name -ne $targetHostName }; Ascending = $true }, Name
+        # Fallback: show all non-target VMs if no Windows filter matches
+        if (-not $candidates -or $candidates.Count -eq 0) {
+            $candidates = Get-VM | Where-Object { $_.Name -ne $TargetVMName } | Sort-Object Name
+        }
+        if (-not $candidates -or $candidates.Count -eq 0) {
+            throw "No candidate helper VMs found in vCenter. Specify -HelperVMName manually."
+        }
+        $selected = Select-FromList -Items @($candidates) `
+            -Prompt "Select helper VM (Windows VM with VirtIO drivers staged):" `
+            -DisplayScript {
+                param($v)
+                $tag = if ($targetHostName -and $v.VMHost.Name -eq $targetHostName) { ' [SAME HOST]' } else { " [host: $($v.VMHost.Name)]" }
+                "$($v.Name)  [$($v.PowerState)]$tag"
+            }
+        $script:HelperVMName = $selected.Name
+        Write-Log "Selected helper VM: $($script:HelperVMName)"
+    }
+
+    # --- VirtIO driver path ---
+    if (-not $VirtIODriverPath) {
+        Write-Host ""
+        Write-Host "  No -VirtIODriverPath specified." -ForegroundColor Cyan
+        Write-Host "  Enter the path to the VirtIO driver folder AS SEEN FROM INSIDE the helper VM." -ForegroundColor Cyan
+        Write-Host "  Common locations: C:\Drivers\virtio-win  |  C:\virtio-win  |  D:\virtio-win" -ForegroundColor DarkGray
+        Write-Host ""
+        $entered = (Read-Host "  VirtIO driver path").Trim()
+        if (-not $entered) {
+            throw "VirtIO driver path is required. Re-run with -VirtIODriverPath to specify it explicitly."
+        }
+        $script:VirtIODriverPath = $entered
+        Write-Log "VirtIO driver path set to: $($script:VirtIODriverPath)"
+    }
+}
+
+# --- Resolve Morpheus target parameters before connecting to vCenter ---
+if ($TriggerMorpheusMigration) {
+    Resolve-MorpheusTargetParameters
+}
+
+# --- Connect to vCenter (needed for both VM discovery and the migration itself) ---
+Connect-VC
+
+# --- Resolve vCenter parameters (TargetVMName, HelperVMName, VirtIODriverPath) ---
+Resolve-VCenterTargetParameters
+
 Write-Log "=== HPE Morpheus Pre-Migration VirtIO Injection via Helper VM ==="
 Write-Log "Target VM      : $TargetVMName"
-Write-Log "Helper VM      : $HelperVMName"
-Write-Log "VirtIO Path    : $VirtIODriverPath (path as seen from inside the helper VM)"
+Write-Log "Helper VM      : $(if ($HelperVMName) { $HelperVMName } else { 'N/A (MigrationOnly)' })"
+Write-Log "VirtIO Path    : $(if ($VirtIODriverPath) { "$VirtIODriverPath (path as seen from inside the helper VM)" } else { 'N/A (MigrationOnly)' })"
 Write-Log "OS Folder      : $(if ($GuestOSFolder) { "$GuestOSFolder (override)" } else { '(auto-detect from offline disk)' })"
 Write-Log "Guest Tools    : $(if ($InstallGuestTools) { 'yes' } else { 'no' })"
 Write-Log "Remove VMware  : $(if ($RemoveVMwareTools) { "yes (post-migration via Morpheus agent / WinRM, when -TriggerMorpheusMigration is set)" } else { 'no' })"
 Write-Log "Enable RDP     : $(if ($EnableRDP) { 'yes (pre-migration via VMware guest script)' } else { 'no' })"
 Write-Log "Morpheus Mig.  : $(if ($TriggerMorpheusMigration) { "yes -> $MorpheusServer (cloud: $MorpheusTargetCloudId, net: $(if ($MorpheusTargetNetworkId) { $MorpheusTargetNetworkId } else { 'default' }), store: $(if ($MorpheusTargetStoreId) { $MorpheusTargetStoreId } else { 'default' }))" } else { 'no' })"
 Write-Log "Log File       : $LogFile"
-
-Connect-VC
 
 $targetVM = Get-VM -Name $TargetVMName -ErrorAction Stop
 

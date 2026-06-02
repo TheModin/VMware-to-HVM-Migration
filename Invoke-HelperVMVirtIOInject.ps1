@@ -1032,6 +1032,9 @@ function Wait-ForMorpheusInstance {
     # Polls the Morpheus API until the specified instance reaches 'running' state
     # with an IP address assigned, then returns that IP. If the instance is found
     # in 'stopped' state an attempt is made to start it before continuing to poll.
+    # When running but IP is absent, triggers a Morpheus instance refresh to force
+    # the hypervisor to sync network state. Returns $null on timeout (does not throw)
+    # so callers can proceed with Morpheus-agent-based steps that don't require IP.
     param(
         [Parameter(Mandatory)][int]$InstanceId,
         [hashtable]$Headers,
@@ -1040,9 +1043,13 @@ function Wait-ForMorpheusInstance {
 
     $baseUri = "https://$MorpheusServer"
     Write-Log "Waiting for Morpheus instance $InstanceId to reach running state with IP (timeout: $TimeoutMinutes min)..."
-    $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
+    $deadline    = (Get-Date).AddMinutes($TimeoutMinutes)
+    $pollCount   = 0
+    $refreshEvery = 3   # trigger a refresh every N polls when running but no IP
+
     while ((Get-Date) -lt $deadline) {
         Start-Sleep -Seconds 30
+        $pollCount++
         try {
             $resp = Invoke-MorpheusRestMethod -Uri "$baseUri/api/instances/$InstanceId" `
                         -Method GET -Headers $Headers
@@ -1056,12 +1063,30 @@ function Wait-ForMorpheusInstance {
                     $instance.interfaces -and $instance.interfaces.Count -gt 0) {
                 $ip = $instance.interfaces[0].ipAddress
             }
+            # Filter unusable addresses
+            if ($ip -and ($ip -eq '0.0.0.0' -or $ip -like '169.254.*')) { $ip = $null }
+
             Write-Log "Instance $InstanceId status=$status ip=$(if ($ip) { $ip } else { 'none' })"
-            if ($status -eq 'running' -and $ip -and $ip -ne '0.0.0.0' -and
-                    $ip -notlike '169.254.*') {
+
+            if ($status -eq 'running' -and $ip) {
                 Write-Log "Instance $InstanceId is running at $ip." -Level SUCCESS
                 return $ip
             }
+
+            if ($status -eq 'running' -and -not $ip) {
+                # IP not yet populated — trigger a Morpheus sync every N polls so the
+                # hypervisor guest-agent data is refreshed into the Morpheus DB.
+                if ($pollCount % $refreshEvery -eq 0) {
+                    Write-Log "Instance $InstanceId running but no IP yet — triggering Morpheus refresh..."
+                    try {
+                        Invoke-MorpheusRestMethod -Uri "$baseUri/api/instances/$InstanceId/refresh" `
+                            -Method POST -Headers $Headers | Out-Null
+                    } catch {
+                        Write-Log "Refresh request failed (non-fatal): $_" -Level WARN
+                    }
+                }
+            }
+
             if ($status -eq 'stopped') {
                 Write-Log "Instance $InstanceId is stopped — attempting to start..." -Level WARN
                 try {
@@ -1075,12 +1100,15 @@ function Wait-ForMorpheusInstance {
             Write-Log "Error polling instance ${InstanceId}: $_ — retrying..." -Level WARN
         }
     }
-    throw "Timed out after $TimeoutMinutes min waiting for Morpheus instance $InstanceId to reach running state with IP."
+    Write-Log ("Timed out after $TimeoutMinutes min waiting for IP on instance $InstanceId. " +
+               "Proceeding without IP — WinRM-based steps will be skipped.") -Level WARN
+    return $null
 }
 
 function Install-MorpheusAgent {
-    # Installs the Morpheus agent on an HVM instance via WinRM using the Morpheus API.
-    # Throws if installation times out so the caller can fall back to direct WinRM.
+    # Installs the Morpheus agent on an HVM instance via the server management API.
+    # Uses PUT /api/servers/{serverId}/install-agent — credentials must already be
+    # set on the server record (done by Set-MorpheusInstanceCredentials).
     param(
         [Parameter(Mandatory)][int]$InstanceId,
         [hashtable]$Headers,
@@ -1095,26 +1123,17 @@ function Install-MorpheusAgent {
         return
     }
 
-    $bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($TargetVMPassword)
-    try {
-        $plainPassword = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
-        $agentBody = @{
-            installAgent = @{
-                username      = $TargetVMUser
-                password      = $plainPassword
-                winrmPort     = 5985
-                winrmProtocol = 'http'
-                useWinRM      = $true
-                windows       = $true
-            }
-        } | ConvertTo-Json
-    } finally {
-        [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+    # Resolve the primary server ID from the instance record
+    $serverIds = $instResp.instance.servers
+    if (-not $serverIds -or $serverIds.Count -eq 0) {
+        throw "Cannot resolve server ID for instance $InstanceId — agent install skipped."
     }
+    $serverId = $serverIds[0]
 
-    Write-Log "Triggering Morpheus agent installation on instance $InstanceId via WinRM..."
-    Invoke-MorpheusRestMethod -Uri "$baseUri/api/instances/$InstanceId/install-agent" -Method POST `
-        -Headers $Headers -Body $agentBody -ContentType 'application/json' | Out-Null
+    Write-Log "Triggering Morpheus agent installation on server $serverId (instance $InstanceId)..."
+    Invoke-MorpheusRestMethod -Uri "$baseUri/api/servers/$serverId/install-agent" `
+        -Method PUT -Headers $Headers | Out-Null
+
     Write-Log "Agent installation triggered. Polling for completion (timeout: $TimeoutMinutes min)..."
     $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
     while ((Get-Date) -lt $deadline) {
@@ -1352,16 +1371,19 @@ function Invoke-PostMigrationVMwareToolsRemoval {
     # Orchestrates post-migration VMware Tools removal from a Morpheus HVM instance.
     #
     # Flow:
-    #   1. Wait for the instance to reach 'running' state and obtain its IP
-    #   2. Attempt Morpheus agent installation via WinRM (Morpheus API)
-    #   3. If agent installed: remove tools via Morpheus task execution
-    #   4. If agent unavailable or task fails: remove tools via direct WinRM
+    #   1. Wait for the instance to reach 'running' state and obtain its IP (may be null on timeout)
+    #   2. Attempt Morpheus agent installation via the server management API
+    #   3. If agent installed: remove tools via Morpheus task execution (no IP required)
+    #   4. If agent unavailable or task fails AND IP is available: remove tools via direct WinRM
     param([Parameter(Mandatory)][int]$InstanceId)
 
     $headers = Get-MorpheusAuthHeaders
     Write-Log "Starting post-migration VMware Tools removal for Morpheus instance $InstanceId..."
 
     $targetIP = Wait-ForMorpheusInstance -InstanceId $InstanceId -Headers $headers
+    if (-not $targetIP) {
+        Write-Log "No routable IP available for instance $InstanceId — WinRM fallback will be skipped if agent path fails." -Level WARN
+    }
 
     $agentAvailable = $false
     try {
@@ -1380,7 +1402,12 @@ function Invoke-PostMigrationVMwareToolsRemoval {
         }
     }
 
-    Remove-VMwareToolsViaWinRM -TargetIP $targetIP
+    if ($targetIP) {
+        Remove-VMwareToolsViaWinRM -TargetIP $targetIP
+    } else {
+        Write-Log ("Cannot remove VMware Tools: Morpheus agent unavailable and no routable IP for WinRM. " +
+                   "Remove VMware Tools manually from the migrated VM.") -Level WARN
+    }
 }
 
 function Get-VirtIOGuestOSFolder {

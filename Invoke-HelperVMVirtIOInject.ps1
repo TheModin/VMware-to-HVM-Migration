@@ -1155,6 +1155,8 @@ function Install-MorpheusAgent {
     # Installs the Morpheus agent on an HVM instance via the server management API.
     # Uses PUT /api/servers/{serverId}/install-agent — credentials must already be
     # set on the server record (done by Set-MorpheusInstanceCredentials).
+    # NOTE: agentInstalled / guestAgentStatus live on the SERVER record
+    # (/api/servers/{id}), not on the instance record — poll the server endpoint.
     param(
         [Parameter(Mandatory)][int]$InstanceId,
         [hashtable]$Headers,
@@ -1162,19 +1164,23 @@ function Install-MorpheusAgent {
     )
 
     $baseUri = "https://$MorpheusServer"
-    $instResp = Invoke-MorpheusRestMethod -Uri "$baseUri/api/instances/$InstanceId" `
-                    -Method GET -Headers $Headers
-    if ($instResp.instance.PSObject.Properties['agentInstalled'] -and $instResp.instance.agentInstalled) {
-        Write-Log "Morpheus agent already installed on instance $InstanceId." -Level SUCCESS
-        return
-    }
 
     # Resolve the primary server ID from the instance record
+    $instResp = Invoke-MorpheusRestMethod -Uri "$baseUri/api/instances/$InstanceId" `
+                    -Method GET -Headers $Headers
     $serverIds = $instResp.instance.servers
     if (-not $serverIds -or $serverIds.Count -eq 0) {
         throw "Cannot resolve server ID for instance $InstanceId — agent install skipped."
     }
     $serverId = $serverIds[0]
+
+    # Pre-check: agent may already be installed (check server record, not instance)
+    $srvResp = Invoke-MorpheusRestMethod -Uri "$baseUri/api/servers/$serverId" `
+                    -Method GET -Headers $Headers
+    if ($srvResp.server.agentInstalled -or $srvResp.server.guestAgentStatus -eq 'connected') {
+        Write-Log "Morpheus agent already installed on instance $InstanceId (server $serverId)." -Level SUCCESS
+        return
+    }
 
     Write-Log "Triggering Morpheus agent installation on server $serverId (instance $InstanceId)..."
     Invoke-MorpheusRestMethod -Uri "$baseUri/api/servers/$serverId/install-agent" `
@@ -1184,10 +1190,10 @@ function Install-MorpheusAgent {
     $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
     while ((Get-Date) -lt $deadline) {
         Start-Sleep -Seconds 30
-        $instResp = Invoke-MorpheusRestMethod -Uri "$baseUri/api/instances/$InstanceId" `
+        $srvResp = Invoke-MorpheusRestMethod -Uri "$baseUri/api/servers/$serverId" `
                         -Method GET -Headers $Headers
-        if ($instResp.instance.PSObject.Properties['agentInstalled'] -and $instResp.instance.agentInstalled) {
-            Write-Log "Morpheus agent installed on instance $InstanceId." -Level SUCCESS
+        if ($srvResp.server.agentInstalled -or $srvResp.server.guestAgentStatus -eq 'connected') {
+            Write-Log "Morpheus agent installed on instance $InstanceId (server $serverId)." -Level SUCCESS
             return
         }
         Write-Log "Waiting for agent installation on instance $InstanceId..."

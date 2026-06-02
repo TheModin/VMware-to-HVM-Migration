@@ -1573,9 +1573,12 @@ function Resolve-MorpheusTargetParameters {
     if (-not $MorpheusTargetStoreId) {
         Write-Log "No -MorpheusTargetStoreId specified — querying datastores for cloud $MorpheusTargetCloudId..."
         $storeResp = Invoke-MorpheusRestMethod `
-                         -Uri "$baseUri/api/datastores?zoneId=$MorpheusTargetCloudId&max=100" `
+                         -Uri "$baseUri/api/data-stores?max=100" `
                          -Method GET -Headers $headers
-        $stores = $storeResp.datastores | Sort-Object name
+        # Filter to datastores belonging to the selected HVM cloud (zoneId not supported as query param)
+        $stores = $storeResp.dataStores |
+                  Where-Object { $_.zone.id -eq [int]$MorpheusTargetCloudId } |
+                  Sort-Object name
         if (-not $stores -or $stores.Count -eq 0) {
             Write-Log "No datastores found for cloud $MorpheusTargetCloudId — using default storage." -Level WARN
         } elseif ($stores.Count -eq 1) {

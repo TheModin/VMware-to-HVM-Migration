@@ -1035,15 +1035,12 @@ function Wait-ForMorpheusInstance {
     # When running but IP is absent, triggers a Morpheus instance refresh to force
     # the hypervisor to sync network state. Returns $null on timeout (does not throw)
     # so callers can proceed with Morpheus-agent-based steps that don't require IP.
-    #
-    # TargetNetworkId: when supplied the function prefers the interface whose
-    # network.id matches — avoids picking a stale VMware NIC left in the instance
-    # after KVM migration.
+    # IP is read from connectionInfo[0].ip (Morpheus-maintained, stays current after
+    # KVM migration). interfaces[].ipAddress may hold stale VMware-era addresses.
     param(
         [Parameter(Mandatory)][int]$InstanceId,
         [hashtable]$Headers,
-        [int]$TimeoutMinutes = 30,
-        [int]$TargetNetworkId = 0
+        [int]$TimeoutMinutes = 30
     )
 
     $baseUri = "https://$MorpheusServer"
@@ -1060,33 +1057,25 @@ function Wait-ForMorpheusInstance {
                         -Method GET -Headers $Headers
             $instance = $resp.instance
             $status = $instance.status
-            # Select the best IP from all interfaces.
-            # After KVM migration interfaces[0] may still be the old VMware NIC with
-            # a stale IP. If TargetNetworkId is known we prefer the matching interface;
-            # otherwise we take the first valid address across all interfaces.
-            # connectionInfo[0].ip returns the KVM management link-local address (169.254.x.x).
+            # Select the VM's routable IP.
+            # After KVM migration, connectionInfo[0].ip is the address Morpheus actively
+            # updates from the hypervisor. interfaces[].ipAddress may retain a stale
+            # pre-migration VMware address and is used only as a last resort.
+            $validIp = { param($a) $a -and $a -ne '0.0.0.0' -and $a -notlike '169.254.*' }
             $ip = $null
-            if ($instance.PSObject.Properties['interfaces'] -and $instance.interfaces) {
-                $allIfaces = @($instance.interfaces)
 
-                # Helper: test whether an IP is usable
-                $validIp = { param($a) $a -and $a -ne '0.0.0.0' -and $a -notlike '169.254.*' }
+            # Primary: connectionInfo[0].ip (Morpheus-managed, always current)
+            if ($instance.PSObject.Properties['connectionInfo'] -and $instance.connectionInfo) {
+                $connIp = @($instance.connectionInfo)[0].ip
+                if (& $validIp $connIp) { $ip = $connIp }
+            }
 
-                if ($TargetNetworkId -gt 0) {
-                    # Prefer the interface on the target network
-                    $matched = $allIfaces | Where-Object {
-                        $_.PSObject.Properties['network'] -and $_.network -and
-                        [int]$_.network.id -eq $TargetNetworkId -and
-                        (& $validIp $_.ipAddress)
-                    } | Select-Object -First 1
-                    if ($matched) { $ip = $matched.ipAddress }
-                }
-
-                # Fallback: first valid IP from any interface
-                if (-not $ip) {
-                    $fallback = $allIfaces | Where-Object { & $validIp $_.ipAddress } | Select-Object -First 1
-                    if ($fallback) { $ip = $fallback.ipAddress }
-                }
+            # Fallback: first valid IP from interfaces[]
+            if (-not $ip -and $instance.PSObject.Properties['interfaces'] -and $instance.interfaces) {
+                $fallback = @($instance.interfaces) |
+                    Where-Object { & $validIp $_.ipAddress } |
+                    Select-Object -First 1
+                if ($fallback) { $ip = $fallback.ipAddress }
             }
 
             Write-Log "Instance $InstanceId status=$status ip=$(if ($ip) { $ip } else { 'none' })"
@@ -1403,8 +1392,7 @@ function Invoke-PostMigrationVMwareToolsRemoval {
     $headers = Get-MorpheusAuthHeaders
     Write-Log "Starting post-migration VMware Tools removal for Morpheus instance $InstanceId..."
 
-    $targetIP = Wait-ForMorpheusInstance -InstanceId $InstanceId -Headers $headers `
-                    -TargetNetworkId ([int]$MorpheusTargetNetworkId)
+    $targetIP = Wait-ForMorpheusInstance -InstanceId $InstanceId -Headers $headers
     if (-not $targetIP) {
         Write-Log "No routable IP available for instance $InstanceId — WinRM fallback will be skipped if agent path fails." -Level WARN
     }

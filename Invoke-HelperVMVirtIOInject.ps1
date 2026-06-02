@@ -92,11 +92,11 @@
 
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory)][string]$VCServer,
+    [string]$VCServer = '',
     [string]$TargetVMName = '',
     [string]$HelperVMName = '',
-    [Parameter(Mandatory)][string]$HelperVMUser,
-    [Parameter(Mandatory)][object]$HelperVMPassword,
+    [string]$HelperVMUser = '',
+    [object]$HelperVMPassword = $null,
     [string]$VirtIODriverPath = '',
     [ValidateSet('2k25','2k22','2k19','2k16','2k12R2','w11','w10')][string]$GuestOSFolder = '',  # blank = auto-detect from offline SOFTWARE hive on the target disk
     [string]$SnapshotName = 'Pre-VirtIO-Injection',
@@ -122,6 +122,8 @@ param(
     [switch]$MigrationOnly,
     [switch]$SkipRollbackRestart,
     [switch]$CreatePlanOnly,
+    [switch]$PostMigrationOnly,
+    [int]$MorpheusInstanceId = 0,
     [string]$LogPath = 'C:\Windows\Logs\VirtIO-HelperInject'
 )
 
@@ -149,7 +151,7 @@ function ConvertTo-SecurePassword {
     throw 'Password parameter must be a string, SecureString, or PSCredential.'
 }
 
-$HelperVMPassword = ConvertTo-SecurePassword -Password $HelperVMPassword
+if ($HelperVMPassword) { $HelperVMPassword = ConvertTo-SecurePassword -Password $HelperVMPassword }
 $TargetVMPassword = ConvertTo-SecurePassword -Password $TargetVMPassword
 
 $InstallGuestTools = -not $DoNotInstallGuestTools.IsPresent
@@ -159,6 +161,23 @@ $EnableRDP = -not $DoNotEnableRDP.IsPresent
 if ($PSVersionTable.PSVersion.Major -lt 7) {
     Write-Host "This script requires PowerShell 7.0 or later. Current version: $($PSVersionTable.PSVersion)" -ForegroundColor Red
     throw 'PowerShell 7.0 or later is required to run this script.'
+}
+
+if ($PostMigrationOnly) {
+    if ($MorpheusInstanceId -le 0) {
+        throw '-MorpheusInstanceId is required with -PostMigrationOnly (e.g. -MorpheusInstanceId 193).'
+    }
+    if (-not $MorpheusServer) {
+        throw '-MorpheusServer is required with -PostMigrationOnly.'
+    }
+    if (-not $MorpheusToken -and (-not $MorpheusUser -or -not $MorpheusPassword)) {
+        throw 'Either -MorpheusToken or both -MorpheusUser and -MorpheusPassword are required with -PostMigrationOnly.'
+    }
+} else {
+    # vCenter params are required for all non-PostMigrationOnly modes
+    if (-not $VCServer)         { throw '-VCServer is required.' }
+    if (-not $HelperVMUser)     { throw '-HelperVMUser is required.' }
+    if (-not $HelperVMPassword) { throw '-HelperVMPassword is required.' }
 }
 
 $needsTargetCreds = $InstallGuestTools -or ($RemoveVMwareTools -and $TriggerMorpheusMigration)
@@ -1711,6 +1730,22 @@ function Resolve-VCenterTargetParameters {
         $script:VirtIODriverPath = $entered
         Write-Log "VirtIO driver path set to: $($script:VirtIODriverPath)"
     }
+}
+
+# --- PostMigrationOnly: skip vCenter entirely, run post-migration steps on an existing instance ---
+if ($PostMigrationOnly) {
+    Write-Log "=== HPE Morpheus Post-Migration Steps (PostMigrationOnly) ==="
+    Write-Log "Morpheus instance : $MorpheusInstanceId"
+    Write-Log "Morpheus server   : $MorpheusServer"
+    Write-Log "Log File          : $LogFile"
+    try {
+        Invoke-PostMigrationVMwareToolsRemoval -InstanceId $MorpheusInstanceId
+        Write-Log "Post-migration steps completed for Morpheus instance $MorpheusInstanceId." -Level SUCCESS
+    } catch {
+        Write-Log "Post-migration steps failed: $_" -Level ERROR
+        throw
+    }
+    return
 }
 
 # --- Resolve Morpheus target parameters before connecting to vCenter ---

@@ -98,14 +98,16 @@ C:\Drivers\virtio-win\
 
 ## Detailed Parameter Reference
 
+> **Interactive mode**: Parameters marked *Auto-discover* are optional. When omitted, the script queries vCenter / Morpheus and presents a numbered selection menu so you can pick from available options at runtime. Parameters that cannot be discovered (credentials, server addresses) remain required.
+
 | Parameter | Type | Required | Description |
 | :--- | :--- | :---: | :--- |
 | `-VCServer` | String | **Yes** | vCenter Server FQDN or IP. |
-| `-TargetVMName` | String | **Yes** | Name of the VMware Windows VM to migrate. |
-| `-HelperVMName` | String | **Yes** | Name of the running helper Windows VM on the same ESXi host. |
+| `-TargetVMName` | String | Auto-discover | Name of the VMware Windows VM to migrate. Omit to select interactively from all vCenter VMs. |
+| `-HelperVMName` | String | Auto-discover | Name of the running helper Windows VM. Omit to select interactively (same-host VMs sorted first). Not needed with `-MigrationOnly`. |
 | `-HelperVMUser` | String | **Yes** | Local Admin username on the helper VM. |
 | `-HelperVMPassword` | Object | **Yes** | Local Admin password (string, SecureString, or PSCredential). |
-| `-VirtIODriverPath` | String | **Yes** | Path *as seen from the helper VM* to the staged drivers directory. |
+| `-VirtIODriverPath` | String | Auto-discover | Path *as seen from the helper VM* to the staged drivers directory. Omit to enter interactively. Not needed with `-MigrationOnly`. |
 | `-GuestOSFolder` | String | No | Manually override the auto-detected OS subfolder (Valid: `2k25`, `2k22`, `2k19`, `2k16`, `2k12R2`, `w11`, `w10`). |
 | `-SnapshotName` | String | No | Name of the post-injection safety snapshot (Default: `Pre-VirtIO-Injection`). |
 | `-ForceHardStopMin` | Int | No | Minutes to wait for graceful target shutdown before forcing power-off (Default: `10`). |
@@ -121,9 +123,10 @@ C:\Drivers\virtio-win\
 | `-MorpheusToken` | String | No | Morpheus API bearer token. |
 | `-MorpheusUser` | String | No | Morpheus username (used to fetch token if token parameter is absent). |
 | `-MorpheusPassword` | String | No | Morpheus password (used to fetch token if token parameter is absent). |
-| `-MorpheusTargetCloudId`| String | No | Target HVM Cloud ID in Morpheus. |
-| `-MorpheusTargetNetworkId`| String | No | (Optional) Target Network ID in Morpheus. |
-| `-MorpheusTargetStoreId`| String | No | (Optional) Target Storage/Datastore ID in Morpheus. |
+| `-MorpheusTargetCloudId` | String | Auto-discover | Target HVM Cloud ID in Morpheus. Omit to select interactively from available clouds. |
+| `-MorpheusTargetPoolId` | String | Auto-discover | Target resource pool ID in Morpheus. Omit to select interactively (auto-selects if only one exists). |
+| `-MorpheusTargetNetworkId` | String | Auto-discover | Target Network ID in Morpheus. Omit to select interactively from networks in the target cloud. |
+| `-MorpheusTargetStoreId` | String | Auto-discover | Target Datastore ID in Morpheus. Omit to select interactively (displays free space). |
 | `-MorpheusSkipSSL` | Switch | No | Bypass self-signed SSL validation on the Morpheus endpoint. |
 | `-MorpheusMigrationTimeoutHours` | Int | No | Max hours to wait for migration completion (Default: `4`). |
 | `-LogPath` | String | No | Path to write script logs on management host (Default: `C:\Windows\Logs\VirtIO-HelperInject`). |
@@ -132,7 +135,22 @@ C:\Drivers\virtio-win\
 
 ## Usage Examples
 
-### 1. Basic Offline Injection Only (No Guest Tools)
+### 1. Interactive Mode — Let the Script Discover Everything
+Provide only credentials and switches. The script will query vCenter and Morpheus and present numbered menus to select the target VM, helper VM, network, cloud, and datastore.
+```powershell
+.\Invoke-HelperVMVirtIOInject.ps1 `
+  -VCServer vcsa.company.local `
+  -HelperVMUser "Administrator" `
+  -HelperVMPassword "HelperSecurePass!" `
+  -TargetVMUser "Administrator" `
+  -TargetVMPassword "TargetPass!" `
+  -TriggerMorpheusMigration `
+  -MorpheusServer "morpheus.company.local" `
+  -MorpheusToken "a50c822e-1ff2-4b2a-8742-1e9a7e02df5b" `
+  -MorpheusSkipSSL
+```
+
+### 2. Basic Offline Injection Only (No Guest Tools)
 Prepares the VM `WIN2022-APP` by injecting VirtIO drivers and verifying boot. Guest tools installation is skipped explicitly. Leaves a safety snapshot behind for manual review.
 ```powershell
 .\Invoke-HelperVMVirtIOInject.ps1 `
@@ -145,7 +163,7 @@ Prepares the VM `WIN2022-APP` by injecting VirtIO drivers and verifying boot. Gu
   -DoNotInstallGuestTools
 ```
 
-### 2. Full Injection with Guest Tools and Snapshot Cleanup
+### 3. Full Injection with Guest Tools and Snapshot Cleanup
 Auto-injects VirtIO drivers and installs all Guest Tools (network drivers, balloon service, etc.) silently upon boot (default behaviour), verifies boot, and deletes the safety snapshot automatically.
 ```powershell
 .\Invoke-HelperVMVirtIOInject.ps1 `
@@ -160,8 +178,8 @@ Auto-injects VirtIO drivers and installs all Guest Tools (network drivers, ballo
   -DeleteSnapshot
 ```
 
-### 3. Fully Automated End-to-End Migration to Morpheus HVM
-This will inject the storage drivers offline, install all guest tools on boot, verify the VM boots cleanly, shut it down, trigger the Morpheus migration plan into the target HVM cloud (ID: 5), and poll until completed.
+### 4. Fully Automated End-to-End Migration to Morpheus HVM
+This will inject the storage drivers offline, install all guest tools on boot, verify the VM boots cleanly, shut it down, trigger the Morpheus migration plan into the target HVM cloud (ID: 5), and poll until completed. Network is specified explicitly; omit it (and cloud/pool/datastore) to select interactively.
 ```powershell
 .\Invoke-HelperVMVirtIOInject.ps1 `
   -VCServer vcsa.company.local `
@@ -177,6 +195,7 @@ This will inject the storage drivers offline, install all guest tools on boot, v
   -MorpheusServer "morpheus.company.local" `
   -MorpheusToken "a50c822e-1ff2-4b2a-8742-1e9a7e02df5b" `
   -MorpheusTargetCloudId "5" `
+  -MorpheusTargetNetworkId "22" `
   -MorpheusSkipSSL
 ```
 

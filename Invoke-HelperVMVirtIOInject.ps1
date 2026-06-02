@@ -1294,41 +1294,59 @@ function Remove-VMwareToolsInternal {
     Write-Output "STAGE1_EXIT: $($p.ExitCode)"
     if ($p.ExitCode -eq 0 -or $p.ExitCode -eq 3010) { Write-Output 'VMWARETOOLS_REMOVED'; return }
 
-    # Stage 2: patch the cached MSI — remove VM_CheckRequirements from InstallExecuteSequence
+    # Stage 2: patch cached MSI via COM using InvokeMember (required for WindowsInstaller COM in PS)
+    # Uses packed-GUID registry lookup for the exact LocalPackage path (ref: KGHague gist).
+    # Deletes VM_LogStart and VM_CheckRequirements from the CustomAction table (not InstallExecuteSequence).
     Write-Output "Stage 1 returned $($p.ExitCode) — attempting MSI database patch..."
-    $msiPath = $null
+    $localPackage = $null
     try {
-        $installer = New-Object -ComObject WindowsInstaller.Installer
-        foreach ($c in (Get-ChildItem 'C:\Windows\Installer' -Filter '*.msi' -ErrorAction SilentlyContinue)) {
-            try {
-                $db = $installer.OpenDatabase($c.FullName, 0)
-                $v  = $db.OpenView("SELECT Value FROM Property WHERE Property='ProductName'")
-                $v.Execute()
-                $r  = $v.Fetch()
-                if ($r -and ($r.StringData(1) -like 'VMware Tools*')) { $msiPath = $c.FullName; break }
-            } catch {}
+        $guid = [System.Guid]::Parse($productCode.Trim('{}'))
+        $gs = $guid.ToString('N')
+        $idxLen = [ordered]@{ 0=8; 8=4; 12=4; 16=2; 18=2; 20=12 }
+        $packed = ''
+        foreach ($kv in $idxLen.GetEnumerator()) {
+            $sub = $gs.Substring($kv.Key, $kv.Value)
+            if ($kv.Key -eq 20) {
+                ($sub -split '(.{2})' | Where-Object { $_ }) | ForEach-Object {
+                    $ch = $_ -split '(.{1})' | Where-Object { $_ }
+                    [System.Array]::Reverse($ch); $packed += $ch -join ''
+                }
+            } else {
+                $ch = $sub.ToCharArray(); [System.Array]::Reverse($ch); $packed += $ch -join ''
+            }
         }
-    } catch { Write-Output "COM installer unavailable: $_" }
+        $packedGuid = [System.Guid]::Parse($packed).ToString('N').ToUpper()
+        $regPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData\S-1-5-18\Products\$packedGuid\InstallProperties"
+        $localPackage = (Get-ItemProperty -Path $regPath -ErrorAction Stop).LocalPackage
+        Write-Output "Found LocalPackage: $localPackage"
+    } catch { Write-Output "LocalPackage lookup failed: $_ — cannot patch MSI" }
 
-    if ($msiPath) {
-        Write-Output "Found cached MSI: $msiPath"
+    if ($localPackage -and (Test-Path $localPackage)) {
         $patched = $false
+        $ins2 = $null; $db2 = $null; $vw2 = $null
         try {
-            $ins2  = New-Object -ComObject WindowsInstaller.Installer
-            $db2   = $ins2.OpenDatabase($msiPath, 1)
-            $view2 = $db2.OpenView("DELETE FROM InstallExecuteSequence WHERE Action='VM_CheckRequirements'")
-            $view2.Execute()
-            $db2.Commit()
-            Write-Output 'MSI patched: VM_CheckRequirements removed'
+            $ins2 = New-Object -ComObject WindowsInstaller.Installer
+            $db2  = $ins2.GetType().InvokeMember('OpenDatabase', 'InvokeMethod', $null, $ins2, @($localPackage, 2))
+            $vw2  = $db2.GetType().InvokeMember('OpenView', 'InvokeMethod', $null, $db2,
+                        @("DELETE FROM CustomAction WHERE Action='VM_LogStart' OR Action='VM_CheckRequirements'"))
+            $vw2.GetType().InvokeMember('Execute', 'InvokeMethod', $null, $vw2, $null)
+            $vw2.GetType().InvokeMember('Close',   'InvokeMethod', $null, $vw2, $null)
+            $db2.GetType().InvokeMember('Commit',  'InvokeMethod', $null, $db2, $null)
+            Write-Output 'MSI patched: VM_LogStart and VM_CheckRequirements removed from CustomAction'
             $patched = $true
         } catch { Write-Output "MSI patch failed: $_" }
+        finally {
+            if ($vw2)  { [System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($vw2)  | Out-Null }
+            if ($db2)  { [System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($db2)  | Out-Null }
+            if ($ins2) { [System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($ins2) | Out-Null }
+        }
         if ($patched) {
-            $p2 = Start-Process msiexec.exe -ArgumentList "/x $productCode /qn /norestart" -Wait -PassThru -NoNewWindow
+            $p2 = Start-Process msiexec.exe -ArgumentList "/x `"$localPackage`" /qn /norestart" -Wait -PassThru -NoNewWindow
             Write-Output "STAGE2_EXIT: $($p2.ExitCode)"
             if ($p2.ExitCode -eq 0 -or $p2.ExitCode -eq 3010) { Write-Output 'VMWARETOOLS_REMOVED'; return }
             Write-Output "Stage 2 returned $($p2.ExitCode) — falling back to manual removal"
         }
-    } else { Write-Output 'Cached MSI not found — falling back to manual removal' }
+    } else { Write-Output 'LocalPackage not found on disk — falling back to manual removal' }
 
     # Stage 3: manual forced cleanup (bypasses MSI entirely)
     Write-Output 'Starting manual VMware Tools cleanup...'
@@ -1472,39 +1490,55 @@ function Remove-VMwareToolsInternal {
     if ($p.ExitCode -eq 0 -or $p.ExitCode -eq 3010) { Write-Output 'VMWARETOOLS_REMOVED'; return }
 
     Write-Output "Stage 1 returned $($p.ExitCode) — attempting MSI database patch..."
-    $msiPath = $null
+    $localPackage = $null
     try {
-        $installer = New-Object -ComObject WindowsInstaller.Installer
-        foreach ($c in (Get-ChildItem 'C:\Windows\Installer' -Filter '*.msi' -ErrorAction SilentlyContinue)) {
-            try {
-                $db = $installer.OpenDatabase($c.FullName, 0)
-                $v  = $db.OpenView("SELECT Value FROM Property WHERE Property='ProductName'")
-                $v.Execute()
-                $r  = $v.Fetch()
-                if ($r -and ($r.StringData(1) -like 'VMware Tools*')) { $msiPath = $c.FullName; break }
-            } catch {}
+        $guid = [System.Guid]::Parse($productCode.Trim('{}'))
+        $gs = $guid.ToString('N')
+        $idxLen = [ordered]@{ 0=8; 8=4; 12=4; 16=2; 18=2; 20=12 }
+        $packed = ''
+        foreach ($kv in $idxLen.GetEnumerator()) {
+            $sub = $gs.Substring($kv.Key, $kv.Value)
+            if ($kv.Key -eq 20) {
+                ($sub -split '(.{2})' | Where-Object { $_ }) | ForEach-Object {
+                    $ch = $_ -split '(.{1})' | Where-Object { $_ }
+                    [System.Array]::Reverse($ch); $packed += $ch -join ''
+                }
+            } else {
+                $ch = $sub.ToCharArray(); [System.Array]::Reverse($ch); $packed += $ch -join ''
+            }
         }
-    } catch { Write-Output "COM installer unavailable: $_" }
+        $packedGuid = [System.Guid]::Parse($packed).ToString('N').ToUpper()
+        $regPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData\S-1-5-18\Products\$packedGuid\InstallProperties"
+        $localPackage = (Get-ItemProperty -Path $regPath -ErrorAction Stop).LocalPackage
+        Write-Output "Found LocalPackage: $localPackage"
+    } catch { Write-Output "LocalPackage lookup failed: $_ — cannot patch MSI" }
 
-    if ($msiPath) {
-        Write-Output "Found cached MSI: $msiPath"
+    if ($localPackage -and (Test-Path $localPackage)) {
         $patched = $false
+        $ins2 = $null; $db2 = $null; $vw2 = $null
         try {
-            $ins2  = New-Object -ComObject WindowsInstaller.Installer
-            $db2   = $ins2.OpenDatabase($msiPath, 1)
-            $view2 = $db2.OpenView("DELETE FROM InstallExecuteSequence WHERE Action='VM_CheckRequirements'")
-            $view2.Execute()
-            $db2.Commit()
-            Write-Output 'MSI patched: VM_CheckRequirements removed'
+            $ins2 = New-Object -ComObject WindowsInstaller.Installer
+            $db2  = $ins2.GetType().InvokeMember('OpenDatabase', 'InvokeMethod', $null, $ins2, @($localPackage, 2))
+            $vw2  = $db2.GetType().InvokeMember('OpenView', 'InvokeMethod', $null, $db2,
+                        @("DELETE FROM CustomAction WHERE Action='VM_LogStart' OR Action='VM_CheckRequirements'"))
+            $vw2.GetType().InvokeMember('Execute', 'InvokeMethod', $null, $vw2, $null)
+            $vw2.GetType().InvokeMember('Close',   'InvokeMethod', $null, $vw2, $null)
+            $db2.GetType().InvokeMember('Commit',  'InvokeMethod', $null, $db2, $null)
+            Write-Output 'MSI patched: VM_LogStart and VM_CheckRequirements removed from CustomAction'
             $patched = $true
         } catch { Write-Output "MSI patch failed: $_" }
+        finally {
+            if ($vw2)  { [System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($vw2)  | Out-Null }
+            if ($db2)  { [System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($db2)  | Out-Null }
+            if ($ins2) { [System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($ins2) | Out-Null }
+        }
         if ($patched) {
-            $p2 = Start-Process msiexec.exe -ArgumentList "/x $productCode /qn /norestart" -Wait -PassThru -NoNewWindow
+            $p2 = Start-Process msiexec.exe -ArgumentList "/x `"$localPackage`" /qn /norestart" -Wait -PassThru -NoNewWindow
             Write-Output "STAGE2_EXIT: $($p2.ExitCode)"
             if ($p2.ExitCode -eq 0 -or $p2.ExitCode -eq 3010) { Write-Output 'VMWARETOOLS_REMOVED'; return }
             Write-Output "Stage 2 returned $($p2.ExitCode) — falling back to manual removal"
         }
-    } else { Write-Output 'Cached MSI not found — falling back to manual removal' }
+    } else { Write-Output 'LocalPackage not found on disk — falling back to manual removal' }
 
     Write-Output 'Starting manual VMware Tools cleanup...'
     foreach ($svc in @('VMTools', 'VGAuthService', 'vmvss', 'VMwareCAFCommAmqpListener', 'VMwareCAFManagementAgentHost')) {

@@ -1,8 +1,9 @@
 #Requires -RunAsAdministrator
 
-# Script: Invoke-HelperVMVirtIOInject.ps1
-# Purpose: Offline VirtIO storage driver injection for Windows Server VMs before
-#          migration from VMware to HPE Morpheus VM Essentials / HVM.
+# Script: Invoke-VMwareWindowsMigrationToVME.ps1
+# Purpose: End-to-end automated migration of Windows Server VMs from VMware to
+#          HPE Morpheus VM Essentials (HVM) with VirtIO driver injection,
+#          pre-migration preparation, Morpheus plan execution, and post-migration cleanup.
 # 
 # How it works:
 #   1. Connects to vCenter with PowerCLI

@@ -1,6 +1,6 @@
 # Troubleshooting Guide
 
-This guide covers common issues encountered while using the `Invoke-HelperVMVirtIOInject.ps1` script and outlines practical methods for resolution.
+This guide covers common issues encountered while using the `Invoke-VMwareWindowsMigrationToVME.ps1` script and outlines practical methods for resolution.
 
 ---
 

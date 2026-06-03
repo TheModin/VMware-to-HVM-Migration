@@ -25,7 +25,7 @@ The script auto-detects the target VM's guest OS version by inspecting the build
 
 To add support for a new Windows release (e.g. a future Windows Server or Client version):
 1. **Identify the Build Number**: Find the standard build number of the new OS (e.g. Windows Server 2028 might use a build number like `30000`).
-2. **Update mapping logic**: Modify the `Get-VirtIOGuestOSFolder` function inside `Invoke-HelperVMVirtIOInject.ps1`.
+2. **Update mapping logic**: Modify the `Get-VirtIOGuestOSFolder` function inside `Invoke-VMwareWindowsMigrationToVME.ps1`.
    ```powershell
    $folder = if     ($build -ge 30000) { '2k28'   } # Add new OS mapping here
              elseif ($build -ge 26100) { '2k25'   }
@@ -48,7 +48,7 @@ Before submitting a pull request, perform the following validation:
    pwsh -NoProfile -Command "& {
        \$e = \$t = \$null
        [void][System.Management.Automation.Language.Parser]::ParseFile(
-           (Resolve-Path '.\Invoke-HelperVMVirtIOInject.ps1'),
+           (Resolve-Path '.\Invoke-VMwareWindowsMigrationToVME.ps1'),
            [ref]\$t, [ref]\$e
        )
        if (\$e.Count -eq 0) { 'PARSE_OK' } else { \$e | ForEach-Object { \$_.Message } }

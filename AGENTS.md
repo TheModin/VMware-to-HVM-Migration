@@ -1,6 +1,6 @@
 # Agent Instructions — Prepp-Mig
 
-This workspace contains a single PowerShell 7 script: `Invoke-HelperVMVirtIOInject.ps1`.  
+This workspace contains a single PowerShell 7 script: `Invoke-VMwareWindowsMigrationToVME.ps1`.  
 See [README.md](README.md) for architecture overview and [CONTRIBUTING.md](CONTRIBUTING.md) for extension/testing guidelines.
 
 ---
@@ -12,7 +12,7 @@ Run the parse check before any test execution (run from the repository root):
 pwsh -NoProfile -Command "& {
     \$e = \$t = \$null
     [void][System.Management.Automation.Language.Parser]::ParseFile(
-        (Resolve-Path '.\Invoke-HelperVMVirtIOInject.ps1'),
+        (Resolve-Path '.\Invoke-VMwareWindowsMigrationToVME.ps1'),
         [ref]\$t, [ref]\$e
     )
     if (\$e.Count -eq 0) { 'PARSE_OK' } else { \$e | ForEach-Object { \$_.Message } }

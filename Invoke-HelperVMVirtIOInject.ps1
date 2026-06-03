@@ -163,6 +163,36 @@ if ($PSVersionTable.PSVersion.Major -lt 7) {
     throw 'PowerShell 7.0 or later is required to run this script.'
 }
 
+if (-not $PostMigrationOnly) {
+    $hasVcf    = [bool](Get-Module -ListAvailable -Name 'VCF.PowerCLI')
+    $hasLegacy = [bool](Get-Module -ListAvailable -Name 'VMware.PowerCLI')
+
+    if (-not $hasVcf) {
+        if ($hasLegacy) {
+            Write-Host '' -ForegroundColor Red
+            Write-Host 'VMware.PowerCLI is installed but VCF.PowerCLI is required.' -ForegroundColor Red
+            Write-Host 'Broadcom replaced VMware.PowerCLI with VCF.PowerCLI. Please upgrade:' -ForegroundColor Yellow
+            Write-Host ''
+            Write-Host '    Uninstall-Module VMware.PowerCLI -AllVersions' -ForegroundColor Cyan
+            Write-Host '    Install-Module VCF.PowerCLI -AllowClobber -SkipPublisherCheck' -ForegroundColor Cyan
+            Write-Host ''
+            Write-Host '  -AllowClobber     : resolves cmdlet name conflicts from the old package' -ForegroundColor DarkGray
+            Write-Host '  -SkipPublisherCheck : required because VCF.PowerCLI is signed with a Broadcom' -ForegroundColor DarkGray
+            Write-Host '                        certificate, not the original VMware one' -ForegroundColor DarkGray
+        } else {
+            Write-Host '' -ForegroundColor Red
+            Write-Host 'VCF.PowerCLI is not installed. This script requires VCF.PowerCLI.' -ForegroundColor Red
+            Write-Host 'Install it with:' -ForegroundColor Yellow
+            Write-Host ''
+            Write-Host '    Install-Module VCF.PowerCLI -AllowClobber -SkipPublisherCheck' -ForegroundColor Cyan
+        }
+        Write-Host ''
+        Write-Host 'Full installation guide: https://developer.broadcom.com/powercli/installation-guide' -ForegroundColor Yellow
+        Write-Host '' -ForegroundColor Red
+        throw 'VCF.PowerCLI is required. See the installation instructions above.'
+    }
+}
+
 if ($PostMigrationOnly) {
     if ($MorpheusInstanceId -le 0) {
         throw '-MorpheusInstanceId is required with -PostMigrationOnly (e.g. -MorpheusInstanceId 193).'
@@ -1174,11 +1204,17 @@ function Install-MorpheusAgent {
     }
     $serverId = $serverIds[0]
 
-    # Pre-check: agent may already be installed (check server record, not instance)
+    # Pre-check: agent is considered installed only when all three fields are populated.
+    # agentInstalled alone can be a stale flag inherited from the VMware server record.
+    # guestAgentStatus alone can show 'connected' before the agent is fully registered.
+    # agentVersion being non-empty is the strongest signal of a complete installation.
     $srvResp = Invoke-MorpheusRestMethod -Uri "$baseUri/api/servers/$serverId" `
                     -Method GET -Headers $Headers
-    if ($srvResp.server.agentInstalled -or $srvResp.server.guestAgentStatus -eq 'connected') {
-        Write-Log "Morpheus agent already installed on instance $InstanceId (server $serverId)." -Level SUCCESS
+    $agentReady = $srvResp.server.agentInstalled -and
+                  $srvResp.server.guestAgentStatus -eq 'connected' -and
+                  -not [string]::IsNullOrEmpty($srvResp.server.agentVersion)
+    if ($agentReady) {
+        Write-Log "Morpheus agent installed on instance $InstanceId (server $serverId, v$($srvResp.server.agentVersion))." -Level SUCCESS
         return
     }
 
@@ -1192,11 +1228,14 @@ function Install-MorpheusAgent {
         Start-Sleep -Seconds 30
         $srvResp = Invoke-MorpheusRestMethod -Uri "$baseUri/api/servers/$serverId" `
                         -Method GET -Headers $Headers
-        if ($srvResp.server.agentInstalled -or $srvResp.server.guestAgentStatus -eq 'connected') {
-            Write-Log "Morpheus agent installed on instance $InstanceId (server $serverId)." -Level SUCCESS
+        $agentReady = $srvResp.server.agentInstalled -and
+                      $srvResp.server.guestAgentStatus -eq 'connected' -and
+                      -not [string]::IsNullOrEmpty($srvResp.server.agentVersion)
+        if ($agentReady) {
+            Write-Log "Morpheus agent installed on instance $InstanceId (server $serverId, v$($srvResp.server.agentVersion))." -Level SUCCESS
             return
         }
-        Write-Log "Waiting for agent installation on instance $InstanceId..."
+        Write-Log "Waiting for agent installation on instance $InstanceId (agentInstalled=$($srvResp.server.agentInstalled), status=$($srvResp.server.guestAgentStatus), version=$($srvResp.server.agentVersion))..."
     }
     throw "Morpheus agent installation timed out on instance $InstanceId after $TimeoutMinutes min."
 }
@@ -1368,57 +1407,68 @@ function Remove-VMwareToolsInternal {
 }
 Remove-VMwareToolsInternal
 '@
-    try {
-        Write-Log "Creating Morpheus task for VMware Tools removal on instance $InstanceId..."
+    $taskName = 'VMware Tools Removal'
+    # Reuse the persistent task if it already exists; create it only if not found.
+    $searchResp = Invoke-MorpheusRestMethod -Uri "$baseUri/api/tasks?name=$([Uri]::EscapeDataString($taskName))" `
+                      -Method GET -Headers $Headers
+    $existingTask = $searchResp.tasks | Where-Object { $_.name -eq $taskName } | Select-Object -First 1
+    if ($existingTask) {
+        $taskId = $existingTask.id
+        Write-Log "Reusing existing Morpheus task '$taskName' (id=$taskId)."
+    } else {
+        Write-Log "Creating Morpheus task '$taskName' for VMware Tools removal..."
         $taskBody = @{
             task = @{
-                name          = "VmwareToolsRemoval-$(Get-Date -Format 'yyyyMMddHHmm')"
-                taskType      = @{ code = 'script' }
-                taskContent   = $removalScript
+                name          = $taskName
+                taskType      = @{ code = 'winrmTask' }
                 executeTarget = 'resource'
+                file          = @{
+                    sourceType = 'local'
+                    content    = $removalScript
+                }
+                taskOptions   = @{ 'winrm.elevated' = $null }
             }
-        } | ConvertTo-Json -Depth 5
+        } | ConvertTo-Json -Depth 6
         $taskResp = Invoke-MorpheusRestMethod -Uri "$baseUri/api/tasks" -Method POST `
                         -Headers $Headers -Body $taskBody -ContentType 'application/json'
         $taskId = $taskResp.task.id
-        Write-Log "Morpheus task created: id=$taskId"
+        Write-Log "Morpheus task '$taskName' created: id=$taskId"
+    }
 
-        $execBody = @{ task = @{ id = $taskId } } | ConvertTo-Json
-        $execResp = Invoke-MorpheusRestMethod -Uri "$baseUri/api/instances/$InstanceId/execute-task" `
-                        -Method POST -Headers $Headers -Body $execBody -ContentType 'application/json'
-        $executionId = $execResp.execution.id
-        Write-Log "Task $taskId execution started: executionId=$executionId. Polling (timeout: $TimeoutMinutes min)..."
-
-        $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
-        while ((Get-Date) -lt $deadline) {
-            Start-Sleep -Seconds 15
-            try {
-                $resultResp = Invoke-MorpheusRestMethod -Uri "$baseUri/api/task-results/$executionId" `
-                                  -Method GET -Headers $Headers
-                $exStatus = $resultResp.execution.status
-                $output   = $resultResp.execution.output
-                Write-Log "Task execution status: $exStatus output: $output"
-                if ($exStatus -eq 'success' -or ($output -match 'VMWARETOOLS_REMOVED|VMWARETOOLS_REMOVED_MANUAL|VMWARETOOLS_NOT_FOUND')) {
-                    Write-Log "VMware Tools removal via Morpheus task succeeded on instance $InstanceId." -Level SUCCESS
-                    return
-                }
-                if ($exStatus -eq 'failed') { throw "Morpheus task execution failed. Output: $output" }
-            } catch {
-                Write-Log "Error polling task result (will retry): $_" -Level WARN
-            }
+    $execBody = @{
+        job = @{
+            targetType = 'instance'
+            instances  = @($InstanceId)
         }
-        throw "Timed out waiting for Morpheus task execution result on instance $InstanceId."
-    } finally {
-        if ($taskId) {
-            try {
-                Invoke-MorpheusRestMethod -Uri "$baseUri/api/tasks/$taskId" `
-                    -Method DELETE -Headers $Headers | Out-Null
-                Write-Log "Morpheus task $taskId deleted."
-            } catch {
-                Write-Log "Could not delete Morpheus task ${taskId}: $_" -Level WARN
+    } | ConvertTo-Json -Depth 4
+    $execResp    = Invoke-MorpheusRestMethod -Uri "$baseUri/api/tasks/$taskId/execute" `
+                       -Method POST -Headers $Headers -Body $execBody -ContentType 'application/json'
+    $executionId = $execResp.jobExecution.id
+    Write-Log "Task $taskId execution started: jobExecutionId=$executionId. Polling (timeout: $TimeoutMinutes min)..."
+
+    $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Seconds 15
+        try {
+            $resultResp = Invoke-MorpheusRestMethod -Uri "$baseUri/api/job-executions/$executionId" `
+                              -Method GET -Headers $Headers
+            $exStatus = $resultResp.jobExecution.status
+            # Output may be at process.output (flat) or in process.events[0].output (per-event)
+            $output   = $resultResp.jobExecution.process.output
+            if (-not $output) {
+                $output = ($resultResp.jobExecution.process.events | Select-Object -First 1).output
             }
+            Write-Log "Task execution status: $exStatus output: $output"
+            if ($exStatus -eq 'success' -or ($output -match 'VMWARETOOLS_REMOVED|VMWARETOOLS_REMOVED_MANUAL|VMWARETOOLS_NOT_FOUND')) {
+                Write-Log "VMware Tools removal via Morpheus task succeeded on instance $InstanceId." -Level SUCCESS
+                return
+            }
+            if ($exStatus -eq 'error') { throw "Morpheus task execution failed. Output: $output" }
+        } catch {
+            Write-Log "Error polling task result (will retry): $_" -Level WARN
         }
     }
+    throw "Timed out waiting for Morpheus task execution result on instance $InstanceId."
 }
 
 function Remove-VMwareToolsViaWinRM {
@@ -1467,8 +1517,14 @@ function Remove-VMwareToolsViaWinRM {
             throw "Could not establish WinRM session to $TargetIP within $TimeoutMinutes min."
         }
 
+        $ts         = Get-Date -Format 'yyyyMMddHHmmss'
+        $taskName   = "VmtRemoval_$ts"
+        $scriptFile = "C:\Windows\Temp\vmtools_remove_$ts.ps1"
+        $resultFile = "C:\Windows\Temp\vmtools_result_$ts.txt"
+        $resultText = $null
+
         try {
-            Write-Log "WinRM session established. Running VMware Tools removal script on $TargetIP..."
+            Write-Log "WinRM session established. Deploying VMware Tools removal task on $TargetIP..."
             # Same 3-stage script used by the Morpheus task path — define once, run remotely.
             $vmRemovalScript = @'
 function Remove-VMwareToolsInternal {
@@ -1559,16 +1615,109 @@ function Remove-VMwareToolsInternal {
 }
 Remove-VMwareToolsInternal
 '@
-            $result = Invoke-Command -Session $session -ScriptBlock ([scriptblock]::Create($vmRemovalScript))
-            $resultText = if ($result -is [array]) { $result -join '; ' } else { "$result" }
+            # Write the removal script to a temp file on the remote machine.
+            Invoke-Command -Session $session -ArgumentList $vmRemovalScript, $scriptFile -ScriptBlock {
+                param($content, $path) Set-Content -Path $path -Value $content -Encoding UTF8
+            }
+            # Register and start a SYSTEM scheduled task so removal runs independently of the WinRM session.
+            # Running directly in the session risks an aborted connection when VMware services are stopped or
+            # msiexec triggers a reboot — the scheduled task survives both scenarios.
+            Invoke-Command -Session $session -ArgumentList $taskName, $scriptFile, $resultFile -ScriptBlock {
+                param($tname, $sf, $rf)
+                $action    = New-ScheduledTaskAction -Execute 'cmd.exe' `
+                                 -Argument "/c powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$sf`" >> `"$rf`" 2>&1"
+                $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+                Register-ScheduledTask -TaskName $tname -Action $action -Principal $principal -Force | Out-Null
+                Start-ScheduledTask -TaskName $tname
+            }
+            Write-Log "Scheduled task '$taskName' started. Closing WinRM session before removal begins..."
+        } finally {
+            # Disconnect immediately so a service/reboot event during removal doesn't abort this session.
+            Remove-PSSession -Session $session -ErrorAction SilentlyContinue
+            $session = $null
+        }
+
+        # Poll for scheduled task completion — opens a fresh WinRM session each attempt so a reboot is survivable.
+        Write-Log "Polling for VMware Tools removal completion on $TargetIP (timeout: $TimeoutMinutes min)..."
+        $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
+        while ((Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 20
+            $pollSession = $null
+            try {
+                $pollSession = New-PSSession -ComputerName $TargetIP -Port 5985 -Credential $cred `
+                                   -Authentication Negotiate -SessionOption $sessionOpts -ErrorAction Stop
+                $taskState = Invoke-Command -Session $pollSession -ArgumentList $taskName -ScriptBlock {
+                    param($tn)
+                    $t = Get-ScheduledTask -TaskName $tn -ErrorAction SilentlyContinue
+                    if ($t) { $t.State } else { 'NotFound' }
+                }
+                if ($taskState -notin @('Running', 'Queued')) {
+                    $rawOutput = Invoke-Command -Session $pollSession -ArgumentList $resultFile -ScriptBlock {
+                        param($rf) if (Test-Path $rf) { Get-Content $rf -Raw } else { 'RESULT_FILE_MISSING' }
+                    }
+                    $resultText = if ($rawOutput) { "$rawOutput".Trim() } else { '' }
+                    Invoke-Command -Session $pollSession -ArgumentList $taskName, $scriptFile, $resultFile -ScriptBlock {
+                        param($tn, $sf, $rf)
+                        Unregister-ScheduledTask -TaskName $tn -Confirm:$false -ErrorAction SilentlyContinue
+                        Remove-Item $sf, $rf -Force -ErrorAction SilentlyContinue
+                    }
+                    break
+                }
+                Write-Log "VMware Tools removal still running on $TargetIP (task state: $taskState)..."
+            } catch {
+                Write-Log "WinRM not yet reachable at $TargetIP — retrying in 20s..." -Level WARN
+            } finally {
+                if ($pollSession) { Remove-PSSession $pollSession -ErrorAction SilentlyContinue }
+            }
+        }
+
+        if ($resultText) {
             Write-Log "VMware Tools removal result: $resultText"
-            if ($result -match 'VMWARETOOLS_REMOVED|VMWARETOOLS_REMOVED_MANUAL|VMWARETOOLS_NOT_FOUND') {
+            if ($resultText -match 'VMWARETOOLS_REMOVED|VMWARETOOLS_REMOVED_MANUAL|VMWARETOOLS_NOT_FOUND') {
                 Write-Log "VMware Tools removal via WinRM succeeded on $TargetIP." -Level SUCCESS
             } else {
-                Write-Log "VMware Tools removal may not have completed on ${TargetIP}: $resultText" -Level WARN
+                # Result file is incomplete — msiexec likely triggered a reboot before the success token
+                # was written. Verify directly: if VMware Tools is gone from the registry, that is success.
+                Write-Log "Result file incomplete (msiexec may have rebooted the VM). Verifying registry on $TargetIP..."
+                $verifySession = $null
+                $verifyDeadline = (Get-Date).AddMinutes(5)
+                while ((Get-Date) -lt $verifyDeadline -and -not $verifySession) {
+                    try {
+                        $verifySession = New-PSSession -ComputerName $TargetIP -Port 5985 -Credential $cred `
+                                             -Authentication Negotiate -SessionOption $sessionOpts -ErrorAction Stop
+                    } catch {
+                        Write-Log "WinRM not yet ready for verification at ${TargetIP} — retrying in 20s..." -Level WARN
+                        Start-Sleep -Seconds 20
+                    }
+                }
+                if ($verifySession) {
+                    try {
+                        $verifyResult = Invoke-Command -Session $verifySession -ScriptBlock {
+                            $regPaths = @(
+                                'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+                                'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+                            )
+                            $toolsKey = Get-ChildItem $regPaths -ErrorAction SilentlyContinue |
+                                ForEach-Object { Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue } |
+                                Where-Object { $_.DisplayName -like 'VMware Tools*' } |
+                                Select-Object -First 1
+                            if ($toolsKey) { "STILL_INSTALLED: $($toolsKey.DisplayName) $($toolsKey.DisplayVersion)" }
+                            else           { 'NOT_INSTALLED' }
+                        }
+                        if ($verifyResult -eq 'NOT_INSTALLED') {
+                            Write-Log "VMware Tools no longer present in registry — removal succeeded (via reboot)." -Level SUCCESS
+                        } else {
+                            Write-Log "VMware Tools removal may not have completed on ${TargetIP}: $verifyResult" -Level WARN
+                        }
+                    } finally {
+                        Remove-PSSession $verifySession -ErrorAction SilentlyContinue
+                    }
+                } else {
+                    Write-Log "Could not reconnect to $TargetIP for verification — removal status unknown." -Level WARN
+                }
             }
-        } finally {
-            Remove-PSSession -Session $session -ErrorAction SilentlyContinue
+        } else {
+            Write-Log "Timed out waiting for VMware Tools removal result from $TargetIP (timeout: $TimeoutMinutes min)." -Level WARN
         }
     } finally {
         if ($trustedHostsModified) {

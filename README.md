@@ -44,6 +44,12 @@ sequenceDiagram
     Mgmt->>Target: Shuts down VM for final migration
     Mgmt->>Morph: Authenticates & creates Morpheus migration plan targeting HVM
     Mgmt->>Morph: Starts migration plan and polls REST API until successful import
+
+    Note over Mgmt,Morph: Phase 5: Post-Migration Cleanup (Optional)
+    Mgmt->>Morph: Waits for HVM instance to reach running state with IP
+    Mgmt->>Morph: Installs Morpheus agent on HVM instance via WinRM
+    Mgmt->>Morph: Executes "VMware Tools Removal" task via Morpheus agent
+    Note over Mgmt,Morph: Falls back to direct WinRM if Morpheus agent path fails
 ```
 
 ---
@@ -63,8 +69,12 @@ sequenceDiagram
 ## Directory Structure & Prerequisites
 
 ### 1. Script Host Requirements
-- **OS**: Windows Management PC or Jump Box with PowerShell 5.1+.
-- **Modules**: VMware PowerCLI module installed (`Install-Module VMware.PowerCLI`).
+- **OS**: Windows Management PC or Jump Box with **PowerShell 7.0 or later** (enforced at startup).
+- **Modules**: VCF.PowerCLI module installed:
+  ```powershell
+  Install-Module VCF.PowerCLI -AllowClobber -SkipPublisherCheck
+  ```
+  > If you previously installed `VMware.PowerCLI`, uninstall it first (`Uninstall-Module VMware.PowerCLI -AllVersions`) as the two packages conflict. See the [Broadcom PowerCLI Installation Guide](https://developer.broadcom.com/powercli/installation-guide) for details.
 - **Privileges**: Administrator on the local execution host, and permissions on vCenter to modify VM settings, run guest scripts, and optionally migrate VMs.
 
 ### 2. The Helper VM

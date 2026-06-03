@@ -7,9 +7,16 @@ See [README.md](README.md) for architecture overview and [CONTRIBUTING.md](CONTR
 
 ## Validate After Every Edit
 
-Run the parse check before any test execution:
+Run the parse check before any test execution (run from the repository root):
 ```powershell
-pwsh -NoProfile -Command "& { `$e = `$t = `$null; [void][System.Management.Automation.Language.Parser]::ParseFile('C:\Scripts\Prepp-Mig\Invoke-HelperVMVirtIOInject.ps1', [ref]`$t, [ref]`$e); if (`$e.Count -eq 0) { 'PARSE_OK' } else { `$e | ForEach-Object { `$_.Message } } }"
+pwsh -NoProfile -Command "& {
+    \$e = \$t = \$null
+    [void][System.Management.Automation.Language.Parser]::ParseFile(
+        (Resolve-Path '.\Invoke-HelperVMVirtIOInject.ps1'),
+        [ref]\$t, [ref]\$e
+    )
+    if (\$e.Count -eq 0) { 'PARSE_OK' } else { \$e | ForEach-Object { \$_.Message } }
+}"
 ```
 Must print `PARSE_OK`. Fix any errors before running the script.
 
@@ -19,16 +26,20 @@ Must print `PARSE_OK`. Fix any errors before running the script.
 
 | Region | Lines (approx) | Purpose |
 |--------|----------------|---------|
-| `param(...)` | 81–109 | All script parameters |
-| Validation block | 136–160 | PS7 gate, param dependency checks |
-| Helper functions | 164–890 | All named functions (do not touch order) |
-| Main execution block | 893–end | Try/catch/finally orchestration |
+| `param(...)` | 93–128 | All script parameters |
+| Validation block | 130–220 | PS7 gate, PowerCLI check, param dependency checks |
+| Helper functions | 230–2062 | All named functions (do not touch order) |
+| Main execution block | 2064–end | PostMigrationOnly fast-path, vCenter connect, full migration flow |
 
 Key functions:
 - `Invoke-MorpheusMigration` — all Morpheus API logic (Steps 1–5)
 - `Get-VirtIOGuestOSFolder` — offline hive OS detection
 - `Enable-AttachedDiskOnHelper` / `Disable-AttachedDiskOnHelper` — helper VM disk management
 - `Get-OfflineWindowsDrive` — identifies Windows drive letter on attached offline disk
+- `Remove-VMwareToolsViaTask` — Morpheus agent task execution for VMware Tools removal
+- `Remove-VMwareToolsViaWinRM` — direct WinRM fallback for VMware Tools removal
+- `Install-MorpheusAgent` — Morpheus agent installation via WinRM
+- `Invoke-PostMigrationVMwareToolsRemoval` — orchestrates post-migration cleanup
 
 ---
 
@@ -75,6 +86,11 @@ Reference: [Morpheus Migration API — addMigration](https://apidocs.morpheusdat
 | Plan field is `servers`, not `vms` | Wrong key → empty migration (plan runs but does nothing) | Always use `servers: [{id: ...}]` |
 | Network mapping: use `networkInterfaces[].destinationNetwork.id` with source NIC `id` fetched from `/api/servers/{id}` | Missing source NIC id → Morpheus NPE at runtime | Fetch server detail before building vmConfig |
 | Failed plans are **not** auto-deleted | User can inspect them in **Tools › Migrations** | Do not DELETE a plan already in `failed` state |
+| Execute task endpoint: `POST /api/tasks/{id}/execute` | Execute body needs `{ "job": { "targetType": "instance", "instances": [id] } }` | `Remove-VMwareToolsViaTask` uses this pattern |
+| Task execution ID in `jobExecution.id` (not `execution.id`) | Wrong field → null executionId → poll fails | Extract from `$resp.jobExecution.id` |
+| Poll execution via `GET /api/job-executions/{id}` | Output at `.jobExecution.process.output` or `.process.events[0].output` | Check both fields; status done = `success`/`error` |
+| PowerShell task type code is `winrmTask` (not `script`) | `script` = Shell/Bash; wrong type runs nothing on Windows | Always use `taskType: { code: 'winrmTask' }` for PS |
+| Script content goes in `file.content` (not `taskContent`) | `taskContent` is not a real API field — content silently ignored | Use `file: { sourceType: 'local', content: '...' }` |
 
 ---
 

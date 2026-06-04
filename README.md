@@ -1,6 +1,6 @@
 # VMware Windows VM Migration to VME (`Invoke-VMwareWindowsMigrationToVME.ps1`)
 
-A automated PowerShell script that migrates Windows VMs from VMware to **HPE Morpheus VM Essentials (HVM)**. It handles the complete migration lifecycle: offline VirtIO driver injection, pre-migration preparation (WinRM, RDP), Morpheus migration plan execution, and post-migration cleanup (Morpheus agent installation, VMware Tools removal).
+An automated PowerShell script that migrates Windows VMs from VMware to **HPE Morpheus VM Essentials (HVM)**. It handles the complete migration lifecycle: offline VirtIO driver injection, pre-migration preparation (WinRM, RDP), Morpheus migration plan execution, and post-migration cleanup (Morpheus agent installation, VMware Tools removal).
 
 Historically, migrating Windows VMs from VMware to KVM platforms results in a **INACCESSIBLE_BOOT_DEVICE** Blue Screen (BSOD) because the target VM lacks VirtIO controllers. This script solves that problem cleanly and automatically.
 

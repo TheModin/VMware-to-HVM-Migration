@@ -6,6 +6,48 @@ Historically, migrating Windows VMs from VMware to KVM platforms results in a **
 
 ---
 
+## ⚠️ Disclaimer & Important Warnings
+
+> **Read this before running the script.**
+
+This script makes **irreversible, destructive changes** to the source VM. By using it you accept full responsibility for the outcome. The author(s) accept **no liability** for data loss, downtime, corruption, or any other damage — direct or indirect — resulting from use of this script. Use entirely at your own risk.
+
+### What the script does to your source VM
+
+| Action | Impact |
+| :--- | :--- |
+| Shuts down the source VM | VM is powered off before disk operations begin |
+| **Permanently merges all existing snapshots** | All snapshot delta disks are committed into the base VMDK. **This cannot be undone.** The script will list existing snapshots and prompt for confirmation before proceeding. |
+| Modifies the offline system disk | VirtIO drivers are injected and the boot registry is edited directly on the VMDK |
+| Migrates the VM into HPE VM Essentials | The source VM is imported into the HVM platform |
+
+### Before you run
+
+- ✅ **Take a full backup or clone the VM** in vSphere before running. A cold clone (full copy) is recommended — not a snapshot, as all snapshots will be merged.
+- ✅ **Test in a lab or non-production environment first.** Do not run against production workloads until you have validated the process end-to-end in a safe environment.
+- ✅ Ensure you have the vCenter permissions and Morpheus API access required.
+- ✅ Review the parameter reference below and verify all values before executing.
+
+> **This script is provided "as is", without warranty of any kind.** The creator(s) make no representations or warranties regarding fitness for any purpose. You are solely responsible for validating that the script is appropriate for your environment and for any consequences of its use.
+
+---
+
+## Compatibility
+
+The table below reflects real-world test results. Untested versions are expected to work (all supported VirtIO driver folders are present) but have not been verified end-to-end. Update this table as you complete test migrations.
+
+| Windows Version | Migration Status | Notes |
+| :--- | :---: | :--- |
+| Windows Server 2025 | ✅ Tested | Full end-to-end migration verified |
+| Windows Server 2022 | ⚠️ Untested | Driver folder `2k22` present |
+| Windows Server 2019 | ⚠️ Untested | Driver folder `2k19` present |
+| Windows Server 2016 | ⚠️ Untested | Driver folder `2k16` present |
+| Windows Server 2012 R2 | ⚠️ Untested | Driver folder `2k12R2` present |
+| Windows 11 | ⚠️ Untested | Driver folder `w11` present |
+| Windows 10 | ⚠️ Untested | Driver folder `w10` present |
+
+---
+
 ## How It Works
 
 Instead of running agents inside every live target VM or relying on manual registry hacking, this script utilizes a secure **Helper VM loop-back mount** technique.

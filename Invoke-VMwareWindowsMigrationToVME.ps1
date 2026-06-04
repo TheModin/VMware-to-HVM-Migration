@@ -47,7 +47,7 @@
 #                      target disk (reliable even on older vCenter that mis-reports
 #                      the guest OS, e.g. reporting 2022 for a 2025 VM).
 #                      Supported values: 2k25, 2k22, 2k19, 2k16, 2k12R2, w11, w10
-#   SnapshotName     - Name for the post-injection safety snapshot
+#   SnapshotName     - Name for the post-injection safety snapshot (default: 'Post-VirtIO-Injection')
 #   ForceHardStopMin - Minutes to wait for graceful shutdown before forcing off
 #   SkipSnapshot     - Switch: skip creating a snapshot after injection
 #   DeleteSnapshot   - Switch: delete the snapshot after confirmed successful boot
@@ -100,7 +100,7 @@ param(
     [object]$HelperVMPassword = $null,
     [string]$VirtIODriverPath = '',
     [ValidateSet('2k25','2k22','2k19','2k16','2k12R2','w11','w10')][string]$GuestOSFolder = '',  # blank = auto-detect from offline SOFTWARE hive on the target disk
-    [string]$SnapshotName = 'Pre-VirtIO-Injection',
+    [string]$SnapshotName = 'Post-VirtIO-Injection',
     [int]$ForceHardStopMin = 10,
     [switch]$SkipSnapshot,
     [switch]$DeleteSnapshot,
@@ -303,13 +303,25 @@ function Remove-AllSnapshots {
     # This function removes all snapshots (commits them into the base disk)
     # and then waits for consolidation to complete.
     param($VM)
-    $snapshots = Get-Snapshot -VM $VM -ErrorAction SilentlyContinue
-    if (-not $snapshots) {
+    $snapshots = @(Get-Snapshot -VM $VM -ErrorAction SilentlyContinue)
+    if ($snapshots.Count -eq 0) {
         Write-Log "No snapshots found on $($VM.Name). Nothing to consolidate."
         return
     }
-    Write-Log "$(@($snapshots).Count) snapshot(s) found. Consolidating all snapshots before disk attach..." -Level WARN
-    Write-Log "Removing all snapshots and committing delta changes into base disk..."
+
+    Write-Log "SNAPSHOT WARNING: $($snapshots.Count) snapshot(s) found on $($VM.Name):" -Level WARN
+    foreach ($snap in $snapshots) {
+        Write-Log "  - '$($snap.Name)' (created: $($snap.Created))" -Level WARN
+    }
+    Write-Log "All snapshots will be permanently merged into the base disk. This CANNOT be undone." -Level WARN
+    Write-Log "To cancel and handle snapshots manually, answer anything other than 'YES'." -Level WARN
+
+    $confirm = Read-Host "Type 'YES' to confirm snapshot consolidation and continue"
+    if ($confirm -cne 'YES') {
+        throw "Snapshot consolidation cancelled. Consolidate or delete snapshots manually in vSphere, then retry."
+    }
+
+    Write-Log "Consolidating all snapshots on $($VM.Name)..."
     Get-Snapshot -VM $VM | Select-Object -First 1 | Remove-Snapshot -RemoveChildren -Confirm:$false | Out-Null
     Write-Log "Waiting for snapshot consolidation to complete..."
     $timeout = (Get-Date).AddMinutes(10)

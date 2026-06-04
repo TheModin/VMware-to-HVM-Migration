@@ -97,7 +97,7 @@ param(
     [string]$TargetVMName = '',
     [string]$HelperVMName = '',
     [string]$HelperVMUser = '',
-    [object]$HelperVMPassword = $null,
+    [System.Security.SecureString]$HelperVMPassword = $null,
     [string]$VirtIODriverPath = '',
     [ValidateSet('2k25','2k22','2k19','2k16','2k12R2','w11','w10')][string]$GuestOSFolder = '',  # blank = auto-detect from offline SOFTWARE hive on the target disk
     [string]$SnapshotName = 'Post-VirtIO-Injection',
@@ -106,14 +106,14 @@ param(
     [switch]$DeleteSnapshot,
     [switch]$DoNotInstallGuestTools,
     [string]$TargetVMUser,
-    [object]$TargetVMPassword,
+    [System.Security.SecureString]$TargetVMPassword,
     [switch]$DoNotRemoveVMwareTools,
     [switch]$DoNotEnableRDP,
     [switch]$TriggerMorpheusMigration,
     [string]$MorpheusServer,
     [string]$MorpheusToken,
     [string]$MorpheusUser,
-    [string]$MorpheusPassword,
+    [System.Security.SecureString]$MorpheusPassword,
     [string]$MorpheusTargetCloudId,
     [string]$MorpheusTargetNetworkId,
     [string]$MorpheusTargetStoreId,
@@ -130,7 +130,7 @@ param(
 
 function ConvertTo-SecurePassword {
     param(
-        [Parameter(Mandatory)][AllowNull()][object]$Password
+        [Parameter(Mandatory)][AllowNull()][System.Security.SecureString]$Password
     )
 
     if ($null -eq $Password) {
@@ -826,8 +826,9 @@ function Get-MorpheusAuthHeaders {
     $token = $MorpheusToken
     if (-not $token) {
         Write-Log "Obtaining Morpheus API token for user '$MorpheusUser'..."
+        $morpheusPasswordPlain = [System.Net.NetworkCredential]::new('', $MorpheusPassword).Password
         $authBody = "username=$([uri]::EscapeDataString($MorpheusUser))" +
-                    "&password=$([uri]::EscapeDataString($MorpheusPassword))" +
+                    "&password=$([uri]::EscapeDataString($morpheusPasswordPlain))" +
                     "&grant_type=password&client_id=morph-api"
         $authResp = Invoke-MorpheusRestMethod -Uri "$baseUri/oauth/token" -Method POST `
                         -Body $authBody -ContentType 'application/x-www-form-urlencoded'
@@ -1079,7 +1080,7 @@ function Invoke-MorpheusMigration {
         } catch {
             Write-Log "Migration succeeded but could not determine Morpheus instance ID for '$($TargetVM.Name)': $_. Post-migration cleanup will be skipped." -Level WARN
         }
-        if ($instanceId -gt 0 -and $TargetVMPassword -ne $null) {
+        if ($instanceId -gt 0 -and $null -ne $TargetVMPassword) {
             Set-MorpheusInstanceCredentials -InstanceId $instanceId -Headers $headers
         }
         return $instanceId
@@ -2255,7 +2256,7 @@ try {
             break
         } catch {
             Write-Log "Candidate $candidatePath is not the target OS disk. Reason: $_" -Level WARN
-            if ($candidateAttachedDiskNumber -ne $null) {
+            if ($null -ne $candidateAttachedDiskNumber) {
                 try { Disable-AttachedDiskOnHelper -HelperVM $helperVM -DiskNumber $candidateAttachedDiskNumber } catch {
                     Write-Log "Could not offline candidate disk $candidateAttachedDiskNumber before detach: $_" -Level WARN
                 }
@@ -2266,7 +2267,7 @@ try {
         }
     }
 
-    if (-not $attachedDiskPath -or -not $offlineDrive -or $attachedDiskNumber -eq $null) {
+    if (-not $attachedDiskPath -or -not $offlineDrive -or $null -eq $attachedDiskNumber) {
         throw "Could not identify the offline Windows OS disk on target VM $($targetVM.Name)."
     }
 
@@ -2341,7 +2342,7 @@ try {
 }
 catch {
     Write-Log "FATAL ERROR: $_" -Level ERROR
-    if ($attachedDiskNumber -ne $null -and -not $diskOfflined) {
+    if ($null -ne $attachedDiskNumber -and -not $diskOfflined) {
         Write-Log "Cleanup: offlining attached helper disk number $attachedDiskNumber..." -Level WARN
         try {
             Disable-AttachedDiskOnHelper -HelperVM $helperVM -DiskNumber $attachedDiskNumber

@@ -10,7 +10,7 @@ Historically, migrating Windows VMs from VMware to KVM platforms results in a **
 
 > **Read this before running the script.**
 
-This script makes **irreversible, destructive changes** to the source VM. By using it you accept full responsibility for the outcome. The author(s) accept **no liability** for data loss, downtime, corruption, or any other damage — direct or indirect — resulting from use of this script. Use entirely at your own risk.
+This script makes **irreversible changes** to the source VM. By using it you accept full responsibility for the outcome. The author(s) accept **no liability** for data loss, downtime, corruption, or any other damage — direct or indirect — resulting from use of this script. Use entirely at your own risk.
 
 ### What the script does to your source VM
 

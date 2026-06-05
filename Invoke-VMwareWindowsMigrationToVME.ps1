@@ -1501,7 +1501,12 @@ function Remove-VMwareToolsInternal {
     }
     Write-Output 'VMWARETOOLS_REMOVED_MANUAL'
 }
-Remove-VMwareToolsInternal
+$_vmtOut = Remove-VMwareToolsInternal
+$_vmtOut
+if ($_vmtOut -match 'VMWARETOOLS_REMOVED') {
+    Write-Output 'SCHEDULING_REBOOT'
+    & shutdown.exe /r /t 10 /c 'VMware Tools removal complete' 2>&1 | Out-Null
+}
 '@
 
 function Remove-VMwareToolsViaTask {

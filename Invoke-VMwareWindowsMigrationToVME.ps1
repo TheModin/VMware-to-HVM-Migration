@@ -1802,6 +1802,13 @@ function Invoke-PostMigrationVMwareToolsRemoval {
         Write-Log "No routable IP available for instance $InstanceId — WinRM fallback will be skipped if agent path fails." -Level WARN
     }
 
+    # Ensure correct OS credentials are on the server record before agent install.
+    # Morpheus defaults to a cloud-init user (e.g. 'hpe') which causes install-agent
+    # to fail; this is needed both for PostMigrationOnly runs and full migration runs.
+    if ($null -ne $TargetVMPassword) {
+        Set-MorpheusInstanceCredentials -InstanceId $InstanceId -Headers $headers
+    }
+
     $agentAvailable = $false
     try {
         Install-MorpheusAgent -InstanceId $InstanceId -Headers $headers

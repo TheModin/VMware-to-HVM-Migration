@@ -36,20 +36,35 @@ ESXi cannot cross-attach a virtual disk to a VM on another host (unless using hi
 
 ---
 
-## 3. Registry Hive Locks (`reg.exe` fails to unload)
+## 3. Registry Hive Locks (`reg.exe` fails to load or unload)
 
-### Symptom:
+### Symptom A — Hive fails to load (stale mount):
 The script fails with:
-`"Offline registry hive did not unload cleanly. Output: HIVE_UNLOADED was not received."`
-OR the disk detachment phase fails because the target OS files are locked.
+`"SOFTWARE hive failed to load on <drive>. A stale mount from a prior failed run may be present at HKLM\OFFLINESW_DETECT on the helper VM."`
+
+### Symptom B — Hive fails to unload (active handle):
+The script fails with:
+`"SOFTWARE hive did not unload cleanly (HIVE_UNLOAD_FAILED or missing token). A handle may still be open on the target disk."`
 
 ### Explanation:
-When the helper VM loads the target VM's registry hive (`SOFTWARE` or `SYSTEM`), Windows starts tracking active handles on those hives. If a monitoring agent, security scanner, or PowerShell process holds a handle open, `reg.exe unload` fails.
+**Symptom A** occurs when a previous run of the script aborted before the `finally` block could unload the offline hive. The key `HKLM\OFFLINESW_DETECT` (or `HKLM\OFFLINESYS_INJECT`) remains mounted on the Helper VM. Attempting to load the same key name a second time fails with a non-zero exit code.
+
+**Symptom B** occurs when the helper VM loads the target VM's registry hive but a monitoring agent, security scanner, or PowerShell process holds a handle open, preventing `reg.exe unload` from succeeding.
 
 ### Resolution:
-1. **Garbage Collection**: The script includes a garbage collection trigger `[gc]::Collect()` and a short sleep delay inside the helper block to release PowerShell registry provider handles.
-2. **AV Exclusions**: Temporary exclusions of `HKLM\OFFLINESYS_INJECT` and `HKLM\OFFLINESW_DETECT` on the Helper VM's Antivirus (e.g. Microsoft Defender) can prevent active locking during scanning.
-3. **Manual Recovery**: If a hive remains locked, reboot the Helper VM to force-release all locked registry hives, then run the script again.
+**For Symptom A (stale mount):**
+1. On the Helper VM, open an elevated command prompt and run:
+   ```cmd
+   reg unload HKLM\OFFLINESW_DETECT
+   reg unload HKLM\OFFLINESYS_INJECT
+   ```
+2. If the keys no longer exist, the unload will report an error — that is fine; it means the hive is already clear.
+3. Alternatively, **reboot the Helper VM** to force-release all loaded hives, then run the script again.
+
+**For Symptom B (active handle):**
+1. **Garbage Collection**: The script already includes a `[gc]::Collect()` + sleep delay before `reg.exe unload` to release PowerShell registry provider handles. If this is still failing, a third-party process is likely holding the handle.
+2. **AV Exclusions**: Add temporary exclusions for `HKLM\OFFLINESYS_INJECT` and `HKLM\OFFLINESW_DETECT` on the Helper VM's Antivirus (e.g. Microsoft Defender) to prevent active locking during scanning.
+3. **Manual Recovery**: Reboot the Helper VM to force-release all locked hives.
 
 ---
 
@@ -96,5 +111,5 @@ This happens if:
 
 ### Resolution:
 1. **Check OS Mapping Log**: Review the log file to confirm the script auto-detected the correct OS build and mapped it to the right folder (e.g., mapped Windows Server 2025 to `2k25`).
-2. **Rollback**: Power off the target VM in vCenter and restore it to the pre-injection safety snapshot (`Pre-VirtIO-Injection`) created by the script.
+2. **Rollback**: Power off the target VM in vCenter and restore it to the pre-injection safety snapshot (`Post-VirtIO-Injection`, or the custom name you specified with `-SnapshotName`) created by the script.
 3. **Verify Driver Files**: Confirm that `viostor.sys`, `vioscsi.sys` and their corresponding `.inf` files exist in the driver path on the Helper VM.

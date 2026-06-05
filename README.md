@@ -161,7 +161,7 @@ C:\Drivers\virtio-win\
 | `-HelperVMPassword` | Object | **Yes** | Local Admin password (string, SecureString, or PSCredential). |
 | `-VirtIODriverPath` | String | Auto-discover | Path *as seen from the helper VM* to the staged drivers directory. Omit to enter interactively. Not needed with `-MigrationOnly`. |
 | `-GuestOSFolder` | String | No | Manually override the auto-detected OS subfolder (Valid: `2k25`, `2k22`, `2k19`, `2k16`, `2k12R2`, `w11`, `w10`). |
-| `-SnapshotName` | String | No | Name of the post-injection safety snapshot (Default: `Pre-VirtIO-Injection`). |
+| `-SnapshotName` | String | No | Name of the post-injection safety snapshot (Default: `Post-VirtIO-Injection`). |
 | `-ForceHardStopMin` | Int | No | Minutes to wait for graceful target shutdown before forcing power-off (Default: `10`). |
 | `-SkipSnapshot` | Switch | No | Skip creating the post-injection safety snapshot. |
 | `-DeleteSnapshot` | Switch | No | Delete the safety snapshot after confirmed successful boot. |
@@ -174,7 +174,7 @@ C:\Drivers\virtio-win\
 | `-MorpheusServer` | String | No | FQDN or IP of the Morpheus / VM Essentials instance (no `https://`). |
 | `-MorpheusToken` | SecureString | No | Morpheus API bearer token. Pass as `(ConvertTo-SecureString "token" -AsPlainText -Force)` or from a secrets vault. |
 | `-MorpheusUser` | String | No | Morpheus username (used to fetch token if token parameter is absent). |
-| `-MorpheusPassword` | String | No | Morpheus password (used to fetch token if token parameter is absent). |
+| `-MorpheusPassword` | SecureString | No | Morpheus password (used to fetch token if token parameter is absent). Pass as `(ConvertTo-SecureString "password" -AsPlainText -Force)`. |
 | `-MorpheusTargetCloudId` | String | Auto-discover | Target HVM Cloud ID in Morpheus. Omit to select interactively from available clouds. |
 | `-MorpheusTargetPoolId` | String | Auto-discover | Target resource pool ID in Morpheus. Omit to select interactively (auto-selects if only one exists). |
 | `-MorpheusTargetNetworkId` | String | Auto-discover | Target Network ID in Morpheus. Omit to select interactively from networks in the target cloud. |
@@ -185,6 +185,11 @@ C:\Drivers\virtio-win\
 | `-VCUser` | String | No | vCenter username. If omitted, PowerCLI uses ambient SSO credentials. |
 | `-VCPassword` | SecureString | No | vCenter password (used with `-VCUser`). |
 | `-MorpheusMigrationTimeoutHours` | Int | No | Max hours to wait for migration completion (Default: `4`). |
+| `-MigrationOnly` | Switch | No | Skip the VirtIO injection phase entirely and go directly to the Morpheus migration step. Use when the target VM has already been prepared (drivers injected, boot-tested) in a prior run. Requires `-TriggerMorpheusMigration`. |
+| `-CreatePlanOnly` | Switch | No | Create the Morpheus migration plan and print its ID, then exit without running the migration. Useful for reviewing the plan in the Morpheus UI under **Tools › Migrations** before committing to the cutover. Requires `-TriggerMorpheusMigration`. |
+| `-PostMigrationOnly` | Switch | No | Skip vCenter and VirtIO injection entirely. Connects directly to a Morpheus instance that has already been migrated and runs post-migration cleanup (Morpheus agent install + VMware Tools removal). Requires `-MorpheusInstanceId`, `-MorpheusServer`, and auth parameters. |
+| `-MorpheusInstanceId` | Int | No | Morpheus instance ID of an already-migrated VM. Required when using `-PostMigrationOnly`. |
+| `-SkipRollbackRestart` | Switch | No | Skip the automatic VM restart that is triggered when a rollback snapshot is detected after a failed migration attempt. Use with caution — only when you intend to manage the rollback manually. |
 | `-LogPath` | String | No | Path to write script logs on management host (Default: `C:\Windows\Logs\VirtIO-HelperInject`). |
 
 ---
@@ -194,7 +199,7 @@ C:\Drivers\virtio-win\
 ### 1. Interactive Mode — Let the Script Discover Everything
 Provide only credentials and switches. The script will query vCenter and Morpheus and present numbered menus to select the target VM, helper VM, network, cloud, and datastore.
 ```powershell
-.\Invoke-HelperVMVirtIOInject.ps1 `
+.\Invoke-VMwareWindowsMigrationToVME.ps1 `
   -VCServer vcsa.company.local `
   -HelperVMUser "Administrator" `
   -HelperVMPassword "HelperSecurePass!" `
@@ -210,7 +215,7 @@ Provide only credentials and switches. The script will query vCenter and Morpheu
 ### 2. Basic Offline Injection Only (No Guest Tools)
 Prepares the VM `WIN2022-APP` by injecting VirtIO drivers and verifying boot. Guest tools installation is skipped explicitly. Leaves a safety snapshot behind for manual review.
 ```powershell
-.\Invoke-HelperVMVirtIOInject.ps1 `
+.\Invoke-VMwareWindowsMigrationToVME.ps1 `
   -VCServer vcsa.company.local `
   -TargetVMName "WIN2022-APP" `
   -HelperVMName "HELPER-WIN01" `
@@ -223,7 +228,7 @@ Prepares the VM `WIN2022-APP` by injecting VirtIO drivers and verifying boot. Gu
 ### 3. Full Injection with Guest Tools and Snapshot Cleanup
 Auto-injects VirtIO drivers and installs all Guest Tools (network drivers, balloon service, etc.) silently upon boot (default behaviour), verifies boot, and deletes the safety snapshot automatically.
 ```powershell
-.\Invoke-HelperVMVirtIOInject.ps1 `
+.\Invoke-VMwareWindowsMigrationToVME.ps1 `
   -VCServer vcsa.company.local `
   -TargetVMName "WIN2025-SQL" `
   -HelperVMName "HELPER-WIN01" `
@@ -238,7 +243,7 @@ Auto-injects VirtIO drivers and installs all Guest Tools (network drivers, ballo
 ### 4. Fully Automated End-to-End Migration to Morpheus HVM
 This will inject the storage drivers offline, install all guest tools on boot, verify the VM boots cleanly, shut it down, trigger the Morpheus migration plan into the target HVM cloud (ID: 5), and poll until completed. Network is specified explicitly; omit it (and cloud/pool/datastore) to select interactively.
 ```powershell
-.\Invoke-HelperVMVirtIOInject.ps1 `
+.\Invoke-VMwareWindowsMigrationToVME.ps1 `
   -VCServer vcsa.company.local `
   -TargetVMName "WIN2019-WEB01" `
   -HelperVMName "HELPER-WIN01" `
@@ -256,12 +261,25 @@ This will inject the storage drivers offline, install all guest tools on boot, v
   -MorpheusSkipSSL
 ```
 
+### 5. Post-Migration Cleanup on an Already-Migrated VM
+If the full migration ran but post-migration cleanup (Morpheus agent install + VMware Tools removal) failed or was skipped, re-run only that phase against the existing Morpheus instance.
+```powershell
+.\Invoke-VMwareWindowsMigrationToVME.ps1 `
+  -PostMigrationOnly `
+  -MorpheusInstanceId 193 `
+  -MorpheusServer "morpheus.company.local" `
+  -MorpheusToken (ConvertTo-SecureString "a50c822e-1ff2-4b2a-8742-1e9a7e02df5b" -AsPlainText -Force) `
+  -TargetVMUser "Administrator" `
+  -TargetVMPassword "TargetPass!" `
+  -MorpheusSkipSSL
+```
+
 ---
 
 ## Log Output
 
 Logs are generated both on screen (with rich color coding) and appended to a timestamped file located by default at:
-`C:\Windows\Logs\VirtIO-HelperInject\HelperVirtIO_YYYYMMDD_HHMMSS.log`
+`C:\Windows\Logs\VirtIO-HelperInject\HelperVirtIO_yyyyMMdd_HHmmss.log`
 
 ---
 

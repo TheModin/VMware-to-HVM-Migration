@@ -11,7 +11,8 @@ Thank you for contributing to this project! This repository contains automated s
 - **Strict Mode**: Always keep `Set-StrictMode -Version Latest` at the top of the execution flow to prevent undeclared variables and expression bugs.
 - **Error Handling**: Use `$ErrorActionPreference = 'Stop'` and wrap remote/volatile API and PowerCLI operations in `try/catch` blocks.
 - **Avoid plain strings for passwords**: Always handle password arguments using secure techniques. The script uses a custom `ConvertTo-SecurePassword` helper to accept strings, SecureStrings, or PSCredentials.
-- **Clean Registry Handling**: When loading registry hives (`reg.exe load`), ensure the `finally` block unloads the hive (`reg.exe unload`) even if a failure occurs, to prevent locking target disk structures.
+- **Clean Registry Handling**: When loading registry hives (`reg.exe load`), always check `$LASTEXITCODE` immediately after the load (emit `HIVE_LOAD_FAILED` and exit if non-zero), and ensure the `finally` block unloads the hive (`reg.exe unload`) even if a failure occurs, to prevent locking target disk structures.
+- **Script-Scope Variables**: Functions that must share state across boundaries use the `$script:` scope qualifier (e.g., `$script:MorpheusTargetCloudId`). Each such assignment is marked with `# script scope: must mutate across function boundaries`. Do not remove these qualifiers — without them, assignments create local copies that the caller never sees.
 
 ### 2. Logging and Output
 - Do not use raw `Write-Host` or `Write-Output` for progress logging. Always use the built-in `Write-Log` wrapper to ensure all output is timestamped, categorized (`INFO`, `WARN`, `ERROR`, `SUCCESS`), color-coded, and mirrored to the local log file.

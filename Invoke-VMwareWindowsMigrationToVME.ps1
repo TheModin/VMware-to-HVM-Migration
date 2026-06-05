@@ -301,7 +301,7 @@ function Stop-VMGracefully {
     }
     $deadline = (Get-Date).AddMinutes($ForceHardStopMin)
     while ((Get-Date) -lt $deadline) {
-        Start-Sleep 10
+        Start-Sleep -Seconds 10
         if ((Get-VM -Id $VM.Id).PowerState -eq 'PoweredOff') {
             Write-Log "$($VM.Name) shut down cleanly." -Level SUCCESS
             return
@@ -309,7 +309,7 @@ function Stop-VMGracefully {
     }
     Write-Log "Timeout reached. Forcing power off $($VM.Name)..." -Level WARN
     Stop-VM -VM $VM -Kill -Confirm:$false | Out-Null
-    Start-Sleep 5
+    Start-Sleep -Seconds 5
     Write-Log "$($VM.Name) forced off." -Level SUCCESS
 }
 
@@ -679,7 +679,7 @@ function Test-TargetReadiness {
             Write-Log "VMware Tools running on $($vm.Name). Boot confirmed OK." -Level SUCCESS
             return $true
         }
-        Start-Sleep 15
+        Start-Sleep -Seconds 15
     }
     Write-Log "Timed out waiting for VMware Tools on $($TargetVM.Name). Verify manually." -Level WARN
     return $false
@@ -914,7 +914,7 @@ function Get-MorpheusInstanceIdByName {
             $resp = Invoke-MorpheusRestMethod -Uri "$baseUri/api/instances?name=$encodedName&max=10" `
                         -Method GET -Headers $Headers
             $instance = $resp.instances | Where-Object { $_.name -eq $Name } | Select-Object -First 1
-            if ($instance) {
+            if ($null -ne $instance) {
                 Write-Log "Found Morpheus instance '$Name': id=$($instance.id)" -Level SUCCESS
                 return [int]$instance.id
             }
@@ -982,7 +982,7 @@ function Invoke-MorpheusMigration {
         $searchResp = Invoke-MorpheusRestMethod -Uri "$baseUri/api/servers?name=$encodedName&max=10" `
                           -Method GET -Headers $headers
         $morphVM = $searchResp.servers | Where-Object { $_.name -eq $TargetVM.Name } | Select-Object -First 1
-        if (-not $morphVM) {
+        if ($null -eq $morphVM) {
             throw ("'$($TargetVM.Name)' was not found in Morpheus. " +
                    'Ensure the VMware cloud integration has discovered this VM in the Morpheus UI.')
         }
@@ -1000,7 +1000,7 @@ function Invoke-MorpheusMigration {
         elseif ($morphVM.PSObject.Properties['cloud'] -and $morphVM.cloud) { $sourceCloudId = $morphVM.cloud.id }
         elseif ($morphVM.PSObject.Properties['zoneId'] -and $morphVM.zoneId) { $sourceCloudId = $morphVM.zoneId }
 
-        if (-not $sourceCloudId) {
+        if ($null -eq $sourceCloudId) {
             throw ("Cannot determine source cloud for VM '$($TargetVM.Name)' (id=$($morphVM.id)). " +
                    "The Morpheus server response contained neither 'zone', 'cloud', nor 'zoneId'. " +
                    "Ensure the VMware cloud sync is current.")
@@ -1453,28 +1453,28 @@ function Remove-VMwareToolsInternal {
 
     if ($localPackage -and (Test-Path $localPackage)) {
         $patched = $false
-        $ins2 = $null; $db2 = $null; $vw2 = $null
+        $msiInstaller = $null; $msiDatabase = $null; $msiView = $null
         try {
-            $ins2 = New-Object -ComObject WindowsInstaller.Installer
-            $db2  = $ins2.GetType().InvokeMember('OpenDatabase', 'InvokeMethod', $null, $ins2, @($localPackage, 2))
-            $vw2  = $db2.GetType().InvokeMember('OpenView', 'InvokeMethod', $null, $db2,
-                        @("DELETE FROM CustomAction WHERE Action='VM_LogStart' OR Action='VM_CheckRequirements'"))
-            $vw2.GetType().InvokeMember('Execute', 'InvokeMethod', $null, $vw2, $null)
-            $vw2.GetType().InvokeMember('Close',   'InvokeMethod', $null, $vw2, $null)
-            $db2.GetType().InvokeMember('Commit',  'InvokeMethod', $null, $db2, $null)
+            $msiInstaller = New-Object -ComObject WindowsInstaller.Installer
+            $msiDatabase  = $msiInstaller.GetType().InvokeMember('OpenDatabase', 'InvokeMethod', $null, $msiInstaller, @($localPackage, 2))
+            $msiView      = $msiDatabase.GetType().InvokeMember('OpenView', 'InvokeMethod', $null, $msiDatabase,
+                                @("DELETE FROM CustomAction WHERE Action='VM_LogStart' OR Action='VM_CheckRequirements'"))
+            $msiView.GetType().InvokeMember('Execute', 'InvokeMethod', $null, $msiView, $null)
+            $msiView.GetType().InvokeMember('Close',   'InvokeMethod', $null, $msiView, $null)
+            $msiDatabase.GetType().InvokeMember('Commit', 'InvokeMethod', $null, $msiDatabase, $null)
             Write-Output 'MSI patched: VM_LogStart and VM_CheckRequirements removed from CustomAction'
             $patched = $true
         } catch { Write-Output "MSI patch failed: $_" }
         finally {
-            if ($vw2)  { [System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($vw2)  | Out-Null }
-            if ($db2)  { [System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($db2)  | Out-Null }
-            if ($ins2) { [System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($ins2) | Out-Null }
+            if ($msiView)     { [System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($msiView)     | Out-Null }
+            if ($msiDatabase) { [System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($msiDatabase) | Out-Null }
+            if ($msiInstaller){ [System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($msiInstaller)| Out-Null }
         }
         if ($patched) {
-            $p2 = Start-Process msiexec.exe -ArgumentList "/x `"$localPackage`" /qn /norestart" -Wait -PassThru -NoNewWindow
-            Write-Output "STAGE2_EXIT: $($p2.ExitCode)"
-            if ($p2.ExitCode -eq 0 -or $p2.ExitCode -eq 3010) { Write-Output 'VMWARETOOLS_REMOVED'; return }
-            Write-Output "Stage 2 returned $($p2.ExitCode) — falling back to manual removal"
+            $msiProduct = Start-Process msiexec.exe -ArgumentList "/x `"$localPackage`" /qn /norestart" -Wait -PassThru -NoNewWindow
+            Write-Output "STAGE2_EXIT: $($msiProduct.ExitCode)"
+            if ($msiProduct.ExitCode -eq 0 -or $msiProduct.ExitCode -eq 3010) { Write-Output 'VMWARETOOLS_REMOVED'; return }
+            Write-Output "Stage 2 returned $($msiProduct.ExitCode) — falling back to manual removal"
         }
     } else { Write-Output 'LocalPackage not found on disk — falling back to manual removal' }
 
@@ -1525,7 +1525,7 @@ function Remove-VMwareToolsViaTask {
     $searchResp = Invoke-MorpheusRestMethod -Uri "$baseUri/api/tasks?name=$([Uri]::EscapeDataString($taskName))" `
                       -Method GET -Headers $Headers
     $existingTask = $searchResp.tasks | Where-Object { $_.name -eq $taskName } | Select-Object -First 1
-    if ($existingTask) {
+    if ($null -ne $existingTask) {
         $taskId = $existingTask.id
         Write-Log "Reusing existing Morpheus task '$taskName' (id=$taskId)."
     } else {
@@ -1920,24 +1920,24 @@ function Select-FromList {
         [Parameter(Mandatory)][scriptblock]$DisplayScript
     )
 
-    Write-Host ""
-    Write-Host "  $Prompt" -ForegroundColor Cyan
-    Write-Host "  $('─' * [Math]::Min($Prompt.Length, 72))" -ForegroundColor DarkCyan
+    Write-Host ""  # UI-only: intentional Write-Host
+    Write-Host "  $Prompt" -ForegroundColor Cyan  # UI-only: intentional Write-Host
+    Write-Host "  $('─' * [Math]::Min($Prompt.Length, 72))" -ForegroundColor DarkCyan  # UI-only: intentional Write-Host
     for ($i = 0; $i -lt $Items.Count; $i++) {
         $display = & $DisplayScript $Items[$i]
-        Write-Host ("  {0,3}. {1}" -f ($i + 1), $display)
+        Write-Host ("  {0,3}. {1}" -f ($i + 1), $display)  # UI-only: intentional Write-Host
     }
-    Write-Host ""
+    Write-Host ""  # UI-only: intentional Write-Host
     while ($true) {
         $raw = (Read-Host "  Enter number (1-$($Items.Count))").Trim()
         if ($raw -match '^\d+$') {
             $idx = [int]$raw - 1
             if ($idx -ge 0 -and $idx -lt $Items.Count) {
-                Write-Host ""
+                Write-Host ""  # UI-only: intentional Write-Host
                 return $Items[$idx]
             }
         }
-        Write-Host "  Invalid selection — please enter a number between 1 and $($Items.Count)." -ForegroundColor Yellow
+        Write-Host "  Invalid selection — please enter a number between 1 and $($Items.Count)." -ForegroundColor Yellow  # UI-only: intentional Write-Host
     }
 }
 
@@ -1968,12 +1968,14 @@ function Resolve-MorpheusTargetParameters {
                    "Verify that an HVM cloud is configured, or specify -MorpheusTargetCloudId manually.")
         }
         if ($clouds.Count -eq 1) {
+            # script scope: must mutate across function boundaries
             $script:MorpheusTargetCloudId = [string]$clouds[0].id
             Write-Log "Auto-selected only available HVM cloud: $($clouds[0].name) (id=$($script:MorpheusTargetCloudId))" -Level SUCCESS
         } else {
             $selected = Select-FromList -Items $clouds -Prompt "Select target Morpheus cloud:" -DisplayScript {
                 param($z) "$($z.id): $($z.name) [$($z.zoneType.name)]"
             }
+            # script scope: must mutate across function boundaries
             $script:MorpheusTargetCloudId = [string]$selected.id
             Write-Log "Selected Morpheus cloud: $($selected.name) (id=$($script:MorpheusTargetCloudId))"
         }
@@ -1998,12 +2000,14 @@ function Resolve-MorpheusTargetParameters {
                    "Verify that at least one resource pool exists under Infrastructure > Compute > Resource Pools " +
                    "for the target cloud, or specify -MorpheusTargetPoolId manually.")
         } elseif ($pools.Count -eq 1) {
+            # script scope: must mutate across function boundaries
             $script:MorpheusTargetPoolId = [string]$pools[0].id
             Write-Log "Auto-selected only available pool: $($pools[0].name) (id=$($script:MorpheusTargetPoolId))" -Level SUCCESS
         } else {
             $selected = Select-FromList -Items $pools -Prompt "Select target resource pool:" -DisplayScript {
                 param($p) "$($p.id): $($p.name)"
             }
+            # script scope: must mutate across function boundaries
             $script:MorpheusTargetPoolId = [string]$selected.id
             Write-Log "Selected resource pool: $($selected.name) (id=$($script:MorpheusTargetPoolId))"
         }
@@ -2019,12 +2023,14 @@ function Resolve-MorpheusTargetParameters {
         if (-not $nets -or $nets.Count -eq 0) {
             Write-Log "No networks found for cloud $MorpheusTargetCloudId — migration will use default network." -Level WARN
         } elseif ($nets.Count -eq 1) {
+            # script scope: must mutate across function boundaries
             $script:MorpheusTargetNetworkId = [string]$nets[0].id
             Write-Log "Auto-selected only available network: $($nets[0].name) (id=$($script:MorpheusTargetNetworkId))" -Level SUCCESS
         } else {
             $selected = Select-FromList -Items $nets -Prompt "Select target network:" -DisplayScript {
                 param($n) "$($n.id): $($n.name)"
             }
+            # script scope: must mutate across function boundaries
             $script:MorpheusTargetNetworkId = [string]$selected.id
             Write-Log "Selected network: $($selected.name) (id=$($script:MorpheusTargetNetworkId))"
         }
@@ -2043,6 +2049,7 @@ function Resolve-MorpheusTargetParameters {
         if (-not $stores -or $stores.Count -eq 0) {
             Write-Log "No datastores found for cloud $MorpheusTargetCloudId — using default storage." -Level WARN
         } elseif ($stores.Count -eq 1) {
+            # script scope: must mutate across function boundaries
             $script:MorpheusTargetStoreId = [string]$stores[0].id
             Write-Log "Auto-selected only available datastore: $($stores[0].name) (id=$($script:MorpheusTargetStoreId))" -Level SUCCESS
         } else {
@@ -2053,6 +2060,7 @@ function Resolve-MorpheusTargetParameters {
                 } else { '' }
                 "$($d.id): $($d.name)$free"
             }
+            # script scope: must mutate across function boundaries
             $script:MorpheusTargetStoreId = [string]$selected.id
             Write-Log "Selected datastore: $($selected.name) (id=$($script:MorpheusTargetStoreId))"
         }
@@ -2081,6 +2089,7 @@ function Resolve-VCenterTargetParameters {
         $selected = Select-FromList -Items @($allVMs) -Prompt "Select VM to migrate:" -DisplayScript {
             param($v) "$($v.Name)  [$($v.PowerState)]  $($v.Guest.OSFullName)  [host: $($v.VMHost.Name)]"
         }
+        # script scope: must mutate across function boundaries
         $script:TargetVMName = $selected.Name
         Write-Log "Selected target VM: $($script:TargetVMName)"
     }
@@ -2115,21 +2124,21 @@ function Resolve-VCenterTargetParameters {
                 $tag = if ($targetHostName -and $v.VMHost.Name -eq $targetHostName) { ' [SAME HOST]' } else { " [host: $($v.VMHost.Name)]" }
                 "$($v.Name)  [$($v.PowerState)]$tag"
             }
+        # script scope: must mutate across function boundaries
         $script:HelperVMName = $selected.Name
         Write-Log "Selected helper VM: $($script:HelperVMName)"
     }
 
     # --- VirtIO driver path ---
     if (-not $VirtIODriverPath) {
-        Write-Host ""
-        Write-Host "  No -VirtIODriverPath specified." -ForegroundColor Cyan
-        Write-Host "  Enter the path to the VirtIO driver folder AS SEEN FROM INSIDE the helper VM." -ForegroundColor Cyan
-        Write-Host "  Common locations: C:\Drivers\virtio-win  |  C:\virtio-win  |  D:\virtio-win" -ForegroundColor DarkGray
-        Write-Host ""
+        Write-Log "No -VirtIODriverPath specified."
+        Write-Log "Enter the path to the VirtIO driver folder AS SEEN FROM INSIDE the helper VM."
+        Write-Log "  Common locations: C:\Drivers\virtio-win  |  C:\virtio-win  |  D:\virtio-win"
         $entered = (Read-Host "  VirtIO driver path").Trim()
         if (-not $entered) {
             throw "VirtIO driver path is required. Re-run with -VirtIODriverPath to specify it explicitly."
         }
+        # script scope: must mutate across function boundaries
         $script:VirtIODriverPath = $entered
         Write-Log "VirtIO driver path set to: $($script:VirtIODriverPath)"
     }
@@ -2264,7 +2273,7 @@ while ((Get-Date) -lt $helperTimeout) {
         $helperReady = $true
         break
     }
-    Start-Sleep 15
+    Start-Sleep -Seconds 15
 }
 if (-not $helperReady) {
     throw "Timed out waiting for Helper VM $HelperVMName to boot and VMware Tools to report running."

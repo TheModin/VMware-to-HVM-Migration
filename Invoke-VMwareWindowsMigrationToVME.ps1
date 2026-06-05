@@ -97,7 +97,7 @@ param(
     [string]$TargetVMName = '',
     [string]$HelperVMName = '',
     [string]$HelperVMUser = '',
-    [System.Security.SecureString]$HelperVMPassword = $null,
+    [object]$HelperVMPassword = $null,
     [ValidateScript({
         if ([string]::IsNullOrWhiteSpace($_)) { return $true }
         if ($_ -notmatch '^[A-Za-z]:\\') { throw "VirtIODriverPath must be an absolute Windows path (e.g. C:\Drivers\virtio-win). Got: '$_'" }
@@ -113,7 +113,7 @@ param(
     [switch]$DeleteSnapshot,
     [switch]$DoNotInstallGuestTools,
     [string]$TargetVMUser,
-    [System.Security.SecureString]$TargetVMPassword,
+    [object]$TargetVMPassword,
     [switch]$DoNotRemoveVMwareTools,
     [switch]$DoNotEnableRDP,
     [switch]$TriggerMorpheusMigration,
@@ -144,6 +144,9 @@ param(
     [int]$MorpheusInstanceId = 0,
     [string]$LogPath = 'C:\Windows\Logs\VirtIO-HelperInject'
 )
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
 
 function ConvertTo-SecurePassword {
     param(
@@ -234,9 +237,6 @@ if ($TriggerMorpheusMigration) {
     # $MorpheusTargetCloudId, $MorpheusTargetNetworkId, $MorpheusTargetPoolId, and
     # $MorpheusTargetStoreId are resolved interactively if not provided (see Resolve-MorpheusTargetParameters).
 }
-
-Set-StrictMode -Version Latest
-$ErrorActionPreference = 'Stop'
 
 if ($MorpheusSkipSSL) {
     Write-Host '[WARN] -MorpheusSkipSSL is set. TLS certificate validation is DISABLED for all Morpheus API calls. Do not use in production.' -ForegroundColor Yellow
@@ -356,7 +356,13 @@ function Remove-AllSnapshots {
     }
 
     Write-Log "Consolidating all snapshots on $($VM.Name)..."
-    Get-Snapshot -VM $VM | Select-Object -First 1 | Remove-Snapshot -RemoveChildren -Confirm:$false | Out-Null
+    # Remove all root-level snapshots (those with no parent) with their children.
+    # A VM can have multiple independent snapshot chains; removing only -First 1 would
+    # leave the others in place and cause the consolidation wait to time out.
+    $roots = @(Get-Snapshot -VM $VM -ErrorAction SilentlyContinue | Where-Object { $null -eq $_.Parent })
+    foreach ($root in $roots) {
+        Remove-Snapshot -Snapshot $root -RemoveChildren -Confirm:$false | Out-Null
+    }
     Write-Log "Waiting for snapshot consolidation to complete..."
     $timeout = (Get-Date).AddMinutes(10)
     while ((Get-Date) -lt $timeout) {
@@ -624,7 +630,11 @@ try {
     [gc]::Collect()
     Start-Sleep -Seconds 2
     reg.exe unload $tempKey | Out-Null
-    Write-Host "HIVE_UNLOADED"
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "HIVE_UNLOAD_FAILED:$LASTEXITCODE"
+    } else {
+        Write-Host "HIVE_UNLOADED"
+    }
 }
 '@) -replace '__OFFLINE_DRIVE__', $OfflineDrive
     $out = Invoke-HelperScript -HelperVM $HelperVM -Script $regScript -Description 'Set offline BOOT_START registry'
@@ -632,7 +642,7 @@ try {
         Write-Log "One or more service keys missing in offline registry. Verify manually." -Level WARN
     }
     if (-not ($out -match 'HIVE_UNLOADED')) {
-        throw "Offline registry hive did not unload cleanly. Output: $out"
+        throw "Offline registry hive did not unload cleanly (HIVE_UNLOAD_FAILED or missing token). A handle may still be open on the target disk. Output: $out"
     }
     Write-Log "Offline BOOT_START registry update completed." -Level SUCCESS
 }
@@ -744,10 +754,10 @@ function Enable-WinRMOnTarget {
     #
     # Steps performed inside the guest:
     #   1. Enable-PSRemoting -Force
-    #   2. Open WINRM-HTTP-In-TCP-PUBLIC rule (if present)
-    #   3. Add explicit rules for ports 5985 (HTTP) and 5986 (HTTPS)
-    #   4. Enable Basic and Negotiate WinRM authentication
-    #   5. Allow unencrypted traffic (required for HTTP / IP-based connections)
+    #   2. Open WinRM HTTP on Domain/Private profiles only (port 5985)
+    #   3. Open WinRM HTTPS (port 5986)
+    #   4. Enable Negotiate auth; disable Basic auth
+    #   NLA (Network Level Authentication) is intentionally left enabled for security.
     param($TargetVM)
 
     $targetCred = New-Object System.Management.Automation.PSCredential($TargetVMUser, $TargetVMPassword)
@@ -954,10 +964,10 @@ function Invoke-MorpheusMigration {
             Invoke-MorpheusRestMethod -Uri "$baseUri/api/migrations/$PlanId" -Method DELETE -Headers $Headers | Out-Null
             Write-Log "Rollback: deleted Morpheus migration plan $PlanId." -Level SUCCESS
         } catch {
-            if ("$_" -match 'not found|404') {
+            if ($_.Exception.Message -match 'not found|404') {
                 Write-Log "Rollback: migration plan $PlanId already removed (auto-deleted or completed). OK." -Level SUCCESS
             } else {
-                throw "Delete migration plan failed ($PlanId): $_"
+                throw "Delete migration plan failed ($PlanId): $($_.Exception.Message)"
             }
         }
     }
@@ -985,7 +995,17 @@ function Invoke-MorpheusMigration {
         Write-Log "Found in Morpheus: id=$($morphVM.id), cloud=$cloudInfo" -Level SUCCESS
 
         # --- Step 3: Create migration plan ---
-        $sourceCloudId = if ($morphVM.PSObject.Properties['zone'] -and $morphVM.zone) { $morphVM.zone.id } else { $morphVM.zoneId }
+        $sourceCloudId = $null
+        if ($morphVM.PSObject.Properties['zone']  -and $morphVM.zone)  { $sourceCloudId = $morphVM.zone.id  }
+        elseif ($morphVM.PSObject.Properties['cloud'] -and $morphVM.cloud) { $sourceCloudId = $morphVM.cloud.id }
+        elseif ($morphVM.PSObject.Properties['zoneId'] -and $morphVM.zoneId) { $sourceCloudId = $morphVM.zoneId }
+
+        if (-not $sourceCloudId) {
+            throw ("Cannot determine source cloud for VM '$($TargetVM.Name)' (id=$($morphVM.id)). " +
+                   "The Morpheus server response contained neither 'zone', 'cloud', nor 'zoneId'. " +
+                   "Ensure the VMware cloud sync is current.")
+        }
+
         $planName = "PreppMig-$($TargetVM.Name)-$(Get-Date -Format 'yyyyMMdd-HHmm')"
         Write-Log "Creating Morpheus migration plan '$planName' (sourceCloud=$sourceCloudId, targetCloud=$MorpheusTargetCloudId)..."
 
@@ -1004,7 +1024,11 @@ function Invoke-MorpheusMigration {
         # Plan-level networks: sourceNetwork (auto-detected from first NIC) + destinationNetwork
         if ($MorpheusTargetNetworkId) {
             $netId = if ($MorpheusTargetNetworkId -match '^\d+$') { [int]$MorpheusTargetNetworkId } else { $MorpheusTargetNetworkId }
-            $firstNic = @($srvResp.server.interfaces)[0]
+            $interfaces = @($srvResp.server.interfaces)
+            if ($interfaces.Count -eq 0) {
+                throw "Cannot build network mapping: server $($morphVM.id) has no interfaces in Morpheus. Verify the cloud sync is complete."
+            }
+            $firstNic = $interfaces[0]
             $srcNetId = [int]$firstNic.network.id
             $migObj_networks = @( @{ sourceNetwork = @{ id = $srcNetId }; destinationNetwork = @{ id = $netId } } )
             Write-Log "Network mapping: sourceNetwork.id=$srcNetId ($($firstNic.network.name)) -> destinationNetwork.id=$netId"
@@ -1013,7 +1037,11 @@ function Invoke-MorpheusMigration {
         # Plan-level datastores: sourceDatastore (auto-detected from first volume) + destinationDatastore
         if ($MorpheusTargetStoreId) {
             $storeId = if ($MorpheusTargetStoreId -match '^\d+$') { [int]$MorpheusTargetStoreId } else { $MorpheusTargetStoreId }
-            $firstVol = @($srvResp.server.volumes)[0]
+            $volumes = @($srvResp.server.volumes)
+            if ($volumes.Count -eq 0) {
+                throw "Cannot build datastore mapping: server $($morphVM.id) has no volumes in Morpheus. Verify the cloud sync is complete."
+            }
+            $firstVol = $volumes[0]
             $srcDsId = [int]$firstVol.datastoreId
             $migObj_datastores = @( @{ sourceDatastore = @{ id = $srcDsId }; destinationDatastore = @{ id = $storeId } } )
             Write-Log "Datastore mapping: sourceDatastore.id=$srcDsId ($($firstVol.datastore.name)) -> destinationDatastore.id=$storeId"
@@ -1040,8 +1068,8 @@ function Invoke-MorpheusMigration {
         Write-Log "Plan verified: id=$($savedPlan.migration.id), status=$($savedPlan.migration.status)"
 
         if ($CreatePlanOnly) {
-            Write-Log "CreatePlanOnly: plan $migrationPlanId created and logged. Not starting. Inspect it in Morpheus UI under Tools > Migrations." -Level WARN
-            throw "CreatePlanOnly: stopping after plan creation."
+            Write-Log "CreatePlanOnly: plan $migrationPlanId created. Inspect it in Morpheus UI under Tools > Migrations." -Level SUCCESS
+            return $migrationPlanId
         }
 
         # --- Step 4: Start the migration plan ---
@@ -1062,7 +1090,7 @@ function Invoke-MorpheusMigration {
                                   -Method GET -Headers $headers
             } catch {
                 # Morpheus auto-removes completed plans; a 404/not-found means it finished
-                if ("$_" -match 'not found|404|Migration Plan not found') {
+                if ($_.Exception.Message -match 'not found|404|Migration Plan not found') {
                     Write-Log "Migration plan $migrationPlanId was auto-removed by Morpheus — treating as completed." -Level SUCCESS
                     $migrationDone = $true
                     break
@@ -1126,7 +1154,7 @@ function Invoke-MorpheusMigration {
         try {
             $instanceId = Get-MorpheusInstanceIdByName -Name $TargetVM.Name -Headers $headers
         } catch {
-            Write-Log "Migration succeeded but could not determine Morpheus instance ID for '$($TargetVM.Name)': $_. Post-migration cleanup will be skipped." -Level WARN
+            Write-Log "Migration succeeded but could not determine Morpheus instance ID for '$($TargetVM.Name)': $($_.Exception.Message). Post-migration cleanup will be skipped." -Level WARN
         }
         if ($instanceId -gt 0 -and $null -ne $TargetVMPassword) {
             Set-MorpheusInstanceCredentials -InstanceId $instanceId -Headers $headers
@@ -1148,9 +1176,11 @@ function Invoke-MorpheusMigration {
         }
 
         if ($rollbackIssue) {
-            throw "Morpheus migration failed (${migrationError}). Rollback failed for plan ${migrationPlanId}: ${rollbackIssue}"
+            throw "Morpheus migration failed ($($migrationError.Exception.Message)). Rollback failed for plan ${migrationPlanId}: $($rollbackIssue.Exception.Message)"
         }
-        throw "Morpheus migration failed and rollback completed for plan ${migrationPlanId}. Error: ${migrationError}"
+        $rollbackMsg = if ($migrationPlanId) { "Rollback completed for plan $migrationPlanId." }
+                       else                  { 'No migration plan was created; no rollback needed.' }
+        throw "Morpheus migration failed. $rollbackMsg Error: $($migrationError.Exception.Message)"
     }
 }
 
@@ -1171,9 +1201,11 @@ function Wait-ForMorpheusInstance {
 
     $baseUri = "https://$MorpheusServer"
     Write-Log "Waiting for Morpheus instance $InstanceId to reach running state with IP (timeout: $TimeoutMinutes min)..."
-    $deadline    = (Get-Date).AddMinutes($TimeoutMinutes)
-    $pollCount   = 0
-    $refreshEvery = 3   # trigger a refresh every N polls when running but no IP
+    $deadline       = (Get-Date).AddMinutes($TimeoutMinutes)
+    $pollCount      = 0
+    $refreshEvery   = 3   # trigger a refresh every N polls when running but no IP
+    $startAttempts  = 0
+    $maxStartAttempts = 3
 
     while ((Get-Date) -lt $deadline) {
         Start-Sleep -Seconds 30
@@ -1220,18 +1252,23 @@ function Wait-ForMorpheusInstance {
                         Invoke-MorpheusRestMethod -Uri "$baseUri/api/instances/$InstanceId/refresh" `
                             -Method POST -Headers $Headers | Out-Null
                     } catch {
-                        Write-Log "Refresh request failed (non-fatal): $_" -Level WARN
+                        Write-Log "Refresh request failed (non-fatal): $($_.Exception.Message)" -Level WARN
                     }
                 }
             }
 
             if ($status -eq 'stopped') {
-                Write-Log "Instance $InstanceId is stopped — attempting to start..." -Level WARN
-                try {
-                    Invoke-MorpheusRestMethod -Uri "$baseUri/api/instances/$InstanceId/start" `
-                        -Method PUT -Headers $Headers | Out-Null
-                } catch {
-                    Write-Log "Could not start instance ${InstanceId}: $($_.Exception.Message)" -Level WARN
+                if ($startAttempts -lt $maxStartAttempts) {
+                    $startAttempts++
+                    Write-Log "Instance $InstanceId is stopped — start attempt $startAttempts/$maxStartAttempts..." -Level WARN
+                    try {
+                        Invoke-MorpheusRestMethod -Uri "$baseUri/api/instances/$InstanceId/start" `
+                            -Method PUT -Headers $Headers | Out-Null
+                    } catch {
+                        Write-Log "Could not start instance ${InstanceId}: $($_.Exception.Message)" -Level WARN
+                    }
+                } else {
+                    throw "Instance $InstanceId remains in 'stopped' state after $maxStartAttempts start attempts. Check the HVM platform for errors."
                 }
             }
         } catch {
@@ -1350,36 +1387,15 @@ function Set-MorpheusInstanceCredentials {
     }
 }
 
-function Remove-VMwareToolsViaTask {
-    # Removes VMware Tools from a running Morpheus HVM instance by creating a
-    # one-off PowerShell task, executing it on the instance, then cleaning up.
-    # Requires the Morpheus agent to be installed on the instance.
-    #
-    # NOTE: Task result polling uses /api/task-results/:id which may vary by
-    # Morpheus version. If this path fails the caller should fall back to
-    # Remove-VMwareToolsViaWinRM.
-    param(
-        [Parameter(Mandatory)][int]$InstanceId,
-        [hashtable]$Headers,
-        [int]$TimeoutMinutes = 10
-    )
-
-    $baseUri = "https://$MorpheusServer"
-    $taskId = $null
-
-    # 3-stage removal script that handles the KVM post-migration case where msiexec
-    # returns 1603 due to the VM_CheckRequirements custom action failing because
-    # VMware hardware is no longer present.
-    #
-    # Stage 1 — env var bypass (VIT_MSI_DISABLE_VMX_CHECK): works on some VMware Tools
-    #           versions; cheapest to try first.
-    # Stage 2 — MSI database patch: opens the cached MSI in C:\Windows\Installer via
-    #           COM, removes VM_CheckRequirements from InstallExecuteSequence, then
-    #           re-runs msiexec. Reliable clean uninstall when the cache is intact.
-    # Stage 3 — manual forced cleanup: stops services, deletes files and registry keys
-    #           entirely outside MSI. Used when the installer cache is missing or
-    #           both MSI approaches fail.
-    $removalScript = @'
+# Shared VMware Tools removal script used by both Remove-VMwareToolsViaTask (Morpheus task path)
+# and Remove-VMwareToolsViaWinRM (direct WinRM fallback). Defined once here to avoid duplication.
+# The script implements a 3-stage removal strategy:
+#   Stage 1 — env var bypass (VIT_MSI_DISABLE_VMX_CHECK): works on some VMware Tools versions.
+#   Stage 2 — MSI database patch via COM: removes VM_LogStart and VM_CheckRequirements from the
+#             cached MSI CustomAction table, then re-runs msiexec. Reliable when cache is intact.
+#   Stage 3 — manual forced cleanup: stops services, deletes files and registry keys entirely
+#             outside MSI. Used when the installer cache is missing or both MSI approaches fail.
+$script:VmtRemovalScript = @'
 function Remove-VMwareToolsInternal {
     $regPaths = @(
         'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
@@ -1473,6 +1489,28 @@ function Remove-VMwareToolsInternal {
 }
 Remove-VMwareToolsInternal
 '@
+
+function Remove-VMwareToolsViaTask {
+    # Removes VMware Tools from a running Morpheus HVM instance by creating a
+    # one-off PowerShell task, executing it on the instance, then cleaning up.
+    # Requires the Morpheus agent to be installed on the instance.
+    #
+    # NOTE: Task result polling uses /api/task-results/:id which may vary by
+    # Morpheus version. If this path fails the caller should fall back to
+    # Remove-VMwareToolsViaWinRM.
+    #
+    # The removal script is defined at script scope ($script:VmtRemovalScript)
+    # and shared with Remove-VMwareToolsViaWinRM to avoid duplication.
+    param(
+        [Parameter(Mandatory)][int]$InstanceId,
+        [hashtable]$Headers,
+        [int]$TimeoutMinutes = 10
+    )
+
+    $baseUri = "https://$MorpheusServer"
+    $taskId = $null
+
+    $removalScript = $script:VmtRemovalScript
     $taskName = 'VMware Tools Removal'
     # Reuse the persistent task if it already exists; create it only if not found.
     $searchResp = Invoke-MorpheusRestMethod -Uri "$baseUri/api/tasks?name=$([Uri]::EscapeDataString($taskName))" `
@@ -1531,7 +1569,7 @@ Remove-VMwareToolsInternal
             }
             if ($exStatus -eq 'error') { throw "Morpheus task execution failed. Output: $output" }
         } catch {
-            Write-Log "Error polling task result (will retry): $_" -Level WARN
+            Write-Log "Error polling task result (will retry): $($_.Exception.Message)" -Level WARN
         }
     }
     throw "Timed out waiting for Morpheus task execution result on instance $InstanceId."
@@ -1573,9 +1611,11 @@ function Remove-VMwareToolsViaWinRM {
         } else {
             $sessionOpts = New-PSSessionOption
         }
-        $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
+        # Single shared deadline covering both the connection phase and the polling phase.
+        # Using two independent deadlines from the same variable would silently double the wall time.
+        $functionDeadline = (Get-Date).AddMinutes($TimeoutMinutes)
         $session = $null
-        while ((Get-Date) -lt $deadline -and -not $session) {
+        while ((Get-Date) -lt $functionDeadline -and -not $session) {
             try {
                 $session = New-PSSession -ComputerName $TargetIP -Port 5985 -Credential $cred `
                                -Authentication Negotiate -SessionOption $sessionOpts -ErrorAction Stop
@@ -1596,96 +1636,7 @@ function Remove-VMwareToolsViaWinRM {
 
         try {
             Write-Log "WinRM session established. Deploying VMware Tools removal task on $TargetIP..."
-            # Same 3-stage script used by the Morpheus task path — define once, run remotely.
-            $vmRemovalScript = @'
-function Remove-VMwareToolsInternal {
-    $regPaths = @(
-        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
-        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
-    )
-    $toolsKey = Get-ChildItem $regPaths -ErrorAction SilentlyContinue |
-        ForEach-Object { Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue } |
-        Where-Object { $_.DisplayName -like 'VMware Tools*' } |
-        Select-Object -First 1
-    if (-not $toolsKey) { Write-Output 'VMWARETOOLS_NOT_FOUND'; return }
-    Write-Output "FOUND: $($toolsKey.DisplayName) $($toolsKey.DisplayVersion)"
-    $productCode = $toolsKey.PSChildName
-
-    [System.Environment]::SetEnvironmentVariable('VIT_MSI_DISABLE_VMX_CHECK', '1', 'Machine')
-    $p = Start-Process msiexec.exe -ArgumentList "/x $productCode /qn /norestart" -Wait -PassThru -NoNewWindow
-    Write-Output "STAGE1_EXIT: $($p.ExitCode)"
-    if ($p.ExitCode -eq 0 -or $p.ExitCode -eq 3010) { Write-Output 'VMWARETOOLS_REMOVED'; return }
-
-    Write-Output "Stage 1 returned $($p.ExitCode) — attempting MSI database patch..."
-    $localPackage = $null
-    try {
-        $guid = [System.Guid]::Parse($productCode.Trim('{}'))
-        $gs = $guid.ToString('N')
-        $idxLen = [ordered]@{ 0=8; 8=4; 12=4; 16=2; 18=2; 20=12 }
-        $packed = ''
-        foreach ($kv in $idxLen.GetEnumerator()) {
-            $sub = $gs.Substring($kv.Key, $kv.Value)
-            if ($kv.Key -eq 20) {
-                ($sub -split '(.{2})' | Where-Object { $_ }) | ForEach-Object {
-                    $ch = $_ -split '(.{1})' | Where-Object { $_ }
-                    [System.Array]::Reverse($ch); $packed += $ch -join ''
-                }
-            } else {
-                $ch = $sub.ToCharArray(); [System.Array]::Reverse($ch); $packed += $ch -join ''
-            }
-        }
-        $packedGuid = [System.Guid]::Parse($packed).ToString('N').ToUpper()
-        $regPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData\S-1-5-18\Products\$packedGuid\InstallProperties"
-        $localPackage = (Get-ItemProperty -Path $regPath -ErrorAction Stop).LocalPackage
-        Write-Output "Found LocalPackage: $localPackage"
-    } catch { Write-Output "LocalPackage lookup failed: $_ — cannot patch MSI" }
-
-    if ($localPackage -and (Test-Path $localPackage)) {
-        $patched = $false
-        $ins2 = $null; $db2 = $null; $vw2 = $null
-        try {
-            $ins2 = New-Object -ComObject WindowsInstaller.Installer
-            $db2  = $ins2.GetType().InvokeMember('OpenDatabase', 'InvokeMethod', $null, $ins2, @($localPackage, 2))
-            $vw2  = $db2.GetType().InvokeMember('OpenView', 'InvokeMethod', $null, $db2,
-                        @("DELETE FROM CustomAction WHERE Action='VM_LogStart' OR Action='VM_CheckRequirements'"))
-            $vw2.GetType().InvokeMember('Execute', 'InvokeMethod', $null, $vw2, $null)
-            $vw2.GetType().InvokeMember('Close',   'InvokeMethod', $null, $vw2, $null)
-            $db2.GetType().InvokeMember('Commit',  'InvokeMethod', $null, $db2, $null)
-            Write-Output 'MSI patched: VM_LogStart and VM_CheckRequirements removed from CustomAction'
-            $patched = $true
-        } catch { Write-Output "MSI patch failed: $_" }
-        finally {
-            if ($vw2)  { [System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($vw2)  | Out-Null }
-            if ($db2)  { [System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($db2)  | Out-Null }
-            if ($ins2) { [System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($ins2) | Out-Null }
-        }
-        if ($patched) {
-            $p2 = Start-Process msiexec.exe -ArgumentList "/x `"$localPackage`" /qn /norestart" -Wait -PassThru -NoNewWindow
-            Write-Output "STAGE2_EXIT: $($p2.ExitCode)"
-            if ($p2.ExitCode -eq 0 -or $p2.ExitCode -eq 3010) { Write-Output 'VMWARETOOLS_REMOVED'; return }
-            Write-Output "Stage 2 returned $($p2.ExitCode) — falling back to manual removal"
-        }
-    } else { Write-Output 'LocalPackage not found on disk — falling back to manual removal' }
-
-    Write-Output 'Starting manual VMware Tools cleanup...'
-    foreach ($svc in @('VMTools', 'VGAuthService', 'vmvss', 'VMwareCAFCommAmqpListener', 'VMwareCAFManagementAgentHost')) {
-        Stop-Service $svc -Force -ErrorAction SilentlyContinue
-        & sc.exe delete $svc 2>&1 | Out-Null
-    }
-    $vmDir = 'C:\Program Files\VMware'
-    if (Test-Path $vmDir) { Remove-Item $vmDir -Recurse -Force -ErrorAction SilentlyContinue; Write-Output "Deleted: $vmDir" }
-    foreach ($regKey in @(
-        'HKLM:\SOFTWARE\VMware, Inc.',
-        'HKLM:\SOFTWARE\WOW6432Node\VMware, Inc.',
-        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\$productCode",
-        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\$productCode"
-    )) {
-        if (Test-Path $regKey) { Remove-Item $regKey -Recurse -Force -ErrorAction SilentlyContinue; Write-Output "Removed: $regKey" }
-    }
-    Write-Output 'VMWARETOOLS_REMOVED_MANUAL'
-}
-Remove-VMwareToolsInternal
-'@
+            $vmRemovalScript = $script:VmtRemovalScript
             # Write the removal script to a temp file on the remote machine.
             Invoke-Command -Session $session -ArgumentList $vmRemovalScript, $scriptFile -ScriptBlock {
                 param($content, $path) Set-Content -Path $path -Value $content -Encoding UTF8
@@ -1710,8 +1661,7 @@ Remove-VMwareToolsInternal
 
         # Poll for scheduled task completion — opens a fresh WinRM session each attempt so a reboot is survivable.
         Write-Log "Polling for VMware Tools removal completion on $TargetIP (timeout: $TimeoutMinutes min)..."
-        $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
-        while ((Get-Date) -lt $deadline) {
+        while ((Get-Date) -lt $functionDeadline) {
             Start-Sleep -Seconds 20
             $pollSession = $null
             try {
@@ -1739,6 +1689,28 @@ Remove-VMwareToolsInternal
                 Write-Log "WinRM not yet reachable at $TargetIP — retrying in 20s..." -Level WARN
             } finally {
                 if ($pollSession) { Remove-PSSession $pollSession -ErrorAction SilentlyContinue }
+            }
+        }
+
+        # Cleanup guard: if the polling loop timed out while the task was still running,
+        # attempt to unregister the scheduled task and temp files to avoid leftovers.
+        if (-not $resultText) {
+            Write-Log "Polling timed out on $TargetIP. Attempting scheduled task cleanup..." -Level WARN
+            $cleanupSession = $null
+            try {
+                $cleanupSession = New-PSSession -ComputerName $TargetIP -Port 5985 -Credential $cred `
+                                      -Authentication Negotiate -SessionOption $sessionOpts -ErrorAction SilentlyContinue
+                if ($cleanupSession) {
+                    Invoke-Command -Session $cleanupSession -ArgumentList $taskName, $scriptFile, $resultFile -ScriptBlock {
+                        param($tn, $sf, $rf)
+                        Unregister-ScheduledTask -TaskName $tn -Confirm:$false -ErrorAction SilentlyContinue
+                        Remove-Item $sf, $rf -Force -ErrorAction SilentlyContinue
+                    }
+                }
+            } catch {
+                Write-Log "Cleanup after polling timeout failed (non-fatal): $($_.Exception.Message)" -Level WARN
+            } finally {
+                if ($cleanupSession) { Remove-PSSession $cleanupSession -ErrorAction SilentlyContinue }
             }
         }
 
@@ -1821,7 +1793,7 @@ function Invoke-PostMigrationVMwareToolsRemoval {
         Install-MorpheusAgent -InstanceId $InstanceId -Headers $headers
         $agentAvailable = $true
     } catch {
-        Write-Log "Morpheus agent installation skipped or failed: $_ — will use direct WinRM fallback." -Level WARN
+        Write-Log "Morpheus agent installation skipped or failed: $($_.Exception.Message) — will use direct WinRM fallback." -Level WARN
     }
 
     if ($agentAvailable) {
@@ -1829,7 +1801,7 @@ function Invoke-PostMigrationVMwareToolsRemoval {
             Remove-VMwareToolsViaTask -InstanceId $InstanceId -Headers $headers
             return
         } catch {
-            Write-Log "Morpheus task-based removal failed: $_ — falling back to WinRM." -Level WARN
+            Write-Log "Morpheus task-based removal failed: $($_.Exception.Message) — falling back to WinRM." -Level WARN
         }
     }
 
@@ -1850,11 +1822,15 @@ function Get-VirtIOGuestOSFolder {
     # versions cap at Windows Server 2022 even when the VM actually runs 2025.
     #
     # Build number -> VirtIO subfolder mapping:
-    #   >= 26100  -> 2k25   (Windows Server 2025 / Windows 11 24H2)
-    #   >= 20348  -> 2k22   (Windows Server 2022)
-    #   >= 17763  -> 2k19   (Windows Server 2019)
-    #   >= 14393  -> 2k16   (Windows Server 2016)
-    #   >=  9200  -> 2k12R2 (Windows Server 2012 / 2012 R2)
+    #   Client (Windows 10/11 detected from ProductName):
+    #     >= 22000  -> w11   (Windows 11)
+    #     <  22000  -> w10   (Windows 10)
+    #   Server:
+    #     >= 26100  -> 2k25   (Windows Server 2025)
+    #     >= 20348  -> 2k22   (Windows Server 2022)
+    #     >= 17763  -> 2k19   (Windows Server 2019)
+    #     >= 14393  -> 2k16   (Windows Server 2016)
+    #     >=  9200  -> 2k12R2 (Windows Server 2012 / 2012 R2)
     param($HelperVM, [string]$OfflineDrive)
 
     Write-Log "Detecting OS version from offline SOFTWARE hive on $OfflineDrive..."
@@ -1874,7 +1850,11 @@ try {
     [gc]::Collect()
     Start-Sleep -Seconds 2
     reg.exe unload $tempKey 2>&1 | Out-Null
-    Write-Host 'HIVE_UNLOADED'
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "HIVE_UNLOAD_FAILED:$LASTEXITCODE"
+    } else {
+        Write-Host 'HIVE_UNLOADED'
+    }
 }
 '@) -replace '__OFFLINE_DRIVE__', $OfflineDrive
     $out = Invoke-HelperScript -HelperVM $HelperVM -Script $detectScript -Description 'Detect OS from offline SOFTWARE hive'
@@ -1883,28 +1863,37 @@ try {
         throw "SOFTWARE hive not found on $OfflineDrive. Cannot auto-detect OS. Use -GuestOSFolder to override."
     }
     if ($out -notmatch 'HIVE_UNLOADED') {
-        throw "SOFTWARE hive did not unload cleanly. Output: $out"
+        throw "SOFTWARE hive did not unload cleanly (HIVE_UNLOAD_FAILED or missing token). A handle may still be open on the target disk. Output: $out"
     }
 
     $buildStr   = ($out -split "`n" | Where-Object { $_ -match '^BUILD:' } | Select-Object -Last 1) -replace 'BUILD:',''
     $productStr = ($out -split "`n" | Where-Object { $_ -match '^PRODUCT:' } | Select-Object -Last 1) -replace 'PRODUCT:',''
-    $build      = [int]$buildStr.Trim()
+    $buildStr   = $buildStr.Trim()
     $product    = $productStr.Trim()
+
+    if (-not $buildStr -or $buildStr -notmatch '^\d+$') {
+        throw ("Could not read CurrentBuildNumber from offline SOFTWARE hive on $OfflineDrive. " +
+               "Raw hive output: $out. Use -GuestOSFolder to specify the driver folder manually.")
+    }
+    $build = [int]$buildStr
 
     Write-Log "Offline disk OS: '$product' (Build: $build)"
 
-    $folder = if     ($build -ge 26100) { '2k25'   }
-              elseif ($build -ge 20348) { '2k22'   }
-              elseif ($build -ge 17763) { '2k19'   }
-              elseif ($build -ge 14393) { '2k16'   }
-              elseif ($build -ge 9200)  { '2k12R2' }
-              else                      { $null    }
+    $isClient = $product -match 'Windows (10|11)'
+    $folder = if ($isClient) {
+        if ($build -ge 22000) { 'w11' } else { 'w10' }
+    } elseif ($build -ge 26100) { '2k25'   }
+      elseif ($build -ge 20348) { '2k22'   }
+      elseif ($build -ge 17763) { '2k19'   }
+      elseif ($build -ge 14393) { '2k16'   }
+      elseif ($build -ge 9200)  { '2k12R2' }
+      else                      { $null    }
 
     if (-not $folder) {
         throw ("Cannot map OS build $build ('$product') to a VirtIO driver subfolder. " +
                "Use -GuestOSFolder to override manually.")
     }
-    Write-Log "Mapped build $build -> VirtIO subfolder: $folder" -Level SUCCESS
+    Write-Log "Mapped build $build ('$product') -> VirtIO subfolder: $folder" -Level SUCCESS
     return $folder
 }
 
@@ -1992,8 +1981,9 @@ function Resolve-MorpheusTargetParameters {
                  Where-Object { $_.zone.id -eq [int]$MorpheusTargetCloudId } |
                  Sort-Object name
         if (-not $pools -or $pools.Count -eq 0) {
-            $script:MorpheusTargetPoolId = '1'
-            Write-Log "No resource pools found for cloud $MorpheusTargetCloudId — defaulting to pool ID 1." -Level WARN
+            throw ("No resource pools found in Morpheus for cloud $MorpheusTargetCloudId. " +
+                   "Verify that at least one resource pool exists under Infrastructure > Compute > Resource Pools " +
+                   "for the target cloud, or specify -MorpheusTargetPoolId manually.")
         } elseif ($pools.Count -eq 1) {
             $script:MorpheusTargetPoolId = [string]$pools[0].id
             Write-Log "Auto-selected only available pool: $($pools[0].name) (id=$($script:MorpheusTargetPoolId))" -Level SUCCESS
@@ -2142,7 +2132,7 @@ if ($PostMigrationOnly) {
         Invoke-PostMigrationVMwareToolsRemoval -InstanceId $MorpheusInstanceId
         Write-Log "Post-migration steps completed for Morpheus instance $MorpheusInstanceId." -Level SUCCESS
     } catch {
-        Write-Log "Post-migration steps failed: $_" -Level ERROR
+        Write-Log "Post-migration steps failed: $($_.Exception.Message)" -Level ERROR
         throw
     }
     return
@@ -2190,7 +2180,7 @@ if ($MigrationOnly) {
             try {
                 Invoke-PostMigrationVMwareToolsRemoval -InstanceId $morpheusInstanceId
             } catch {
-                Write-Log "Post-migration VMware Tools removal failed (non-fatal): $_" -Level WARN
+                Write-Log "Post-migration VMware Tools removal failed (non-fatal): $($_.Exception.Message)" -Level WARN
             }
         } elseif ($RemoveVMwareTools) {
             Write-Log 'Could not determine Morpheus instance ID — skipping post-migration VMware Tools removal.' -Level WARN
@@ -2239,8 +2229,8 @@ if ($targetHost.Name -ne $helperHost.Name) {
         # Refresh helper VM object to update host properties
         $helperVM = Get-VM -Id $helperVM.Id
     } catch {
-        Write-Log "Failed to migrate Helper VM: $_" -Level ERROR
-        throw "VM host mismatch and migration failed. Please manually align hosts. Error: $_"
+        Write-Log "Failed to migrate Helper VM: $($_.Exception.Message)" -Level ERROR
+        throw "VM host mismatch and migration failed. Please manually align hosts. Error: $($_.Exception.Message)"
     }
 } else {
     Write-Log "Both VMs confirmed on same ESXi host: $($targetHost.Name)" -Level SUCCESS
@@ -2312,14 +2302,14 @@ try {
             Write-Log "OS disk confirmed: $attachedDiskPath (helper disk number $attachedDiskNumber, offline drive $offlineDrive)." -Level SUCCESS
             break
         } catch {
-            Write-Log "Candidate $candidatePath is not the target OS disk. Reason: $_" -Level WARN
+            Write-Log "Candidate $candidatePath is not the target OS disk. Reason: $($_.Exception.Message)" -Level WARN
             if ($null -ne $candidateAttachedDiskNumber) {
                 try { Disable-AttachedDiskOnHelper -HelperVM $helperVM -DiskNumber $candidateAttachedDiskNumber } catch {
-                    Write-Log "Could not offline candidate disk $candidateAttachedDiskNumber before detach: $_" -Level WARN
+                    Write-Log "Could not offline candidate disk $candidateAttachedDiskNumber before detach: $($_.Exception.Message)" -Level WARN
                 }
             }
             try { Remove-TargetDiskFromHelper -HelperVM $helperVM -DiskPath $candidatePath } catch {
-                Write-Log "Could not detach candidate disk ${candidatePath}: $_" -Level WARN
+                Write-Log "Could not detach candidate disk ${candidatePath}: $($_.Exception.Message)" -Level WARN
             }
         }
     }
@@ -2381,7 +2371,7 @@ try {
                 try {
                     Invoke-PostMigrationVMwareToolsRemoval -InstanceId $morpheusInstanceId
                 } catch {
-                    Write-Log "Post-migration VMware Tools removal failed (non-fatal): $_" -Level WARN
+                    Write-Log "Post-migration VMware Tools removal failed (non-fatal): $($_.Exception.Message)" -Level WARN
                 }
             } elseif ($RemoveVMwareTools) {
                 Write-Log 'Could not determine Morpheus instance ID — skipping post-migration VMware Tools removal.' -Level WARN

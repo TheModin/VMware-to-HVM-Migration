@@ -1014,14 +1014,15 @@ function Invoke-MorpheusMigration {
 
         # Fetch source server details once (needed for network + datastore source IDs)
         $srvResp = $null
-        $migObj_networks = $null
         $migObj_datastores = $null
         if ($MorpheusTargetNetworkId -or $MorpheusTargetStoreId) {
             Write-Log "Looking up source server details for server $($morphVM.id)..."
             $srvResp = Invoke-MorpheusRestMethod -Uri "$baseUri/api/servers/$($morphVM.id)" -Method GET -Headers $headers
         }
 
-        # Plan-level networks: sourceNetwork (auto-detected from first NIC) + destinationNetwork
+        # Per-server NIC mapping: Morpheus expects vmConfig.networkInterfaces[].{id, destinationNetwork.id}
+        # where id is the source NIC's own ID (not the backing network ID).
+        # A plan-level 'networks' key is silently ignored by the Morpheus migration engine.
         if ($MorpheusTargetNetworkId) {
             $netId = if ($MorpheusTargetNetworkId -match '^\d+$') { [int]$MorpheusTargetNetworkId } else { $MorpheusTargetNetworkId }
             $interfaces = @($srvResp.server.interfaces)
@@ -1029,9 +1030,10 @@ function Invoke-MorpheusMigration {
                 throw "Cannot build network mapping: server $($morphVM.id) has no interfaces in Morpheus. Verify the cloud sync is complete."
             }
             $firstNic = $interfaces[0]
-            $srcNetId = [int]$firstNic.network.id
-            $migObj_networks = @( @{ sourceNetwork = @{ id = $srcNetId }; destinationNetwork = @{ id = $netId } } )
-            Write-Log "Network mapping: sourceNetwork.id=$srcNetId ($($firstNic.network.name)) -> destinationNetwork.id=$netId"
+            $nicId    = [int]$firstNic.id
+            if (-not $serverObj.ContainsKey('vmConfig')) { $serverObj['vmConfig'] = [ordered]@{} }
+            $serverObj['vmConfig']['networkInterfaces'] = @( @{ id = $nicId; destinationNetwork = @{ id = $netId } } )
+            Write-Log "Network mapping: NIC id=$nicId ($($firstNic.network.name)) -> destinationNetwork.id=$netId"
         }
 
         # Plan-level datastores: sourceDatastore (auto-detected from first volume) + destinationDatastore
@@ -1054,7 +1056,6 @@ function Invoke-MorpheusMigration {
             servers     = @( $serverObj )
             targetPool  = @{ id = [int]$MorpheusTargetPoolId }
         }
-        if ($migObj_networks)   { $migObj.networks   = $migObj_networks }
         if ($migObj_datastores) { $migObj.datastores  = $migObj_datastores }
         $planBody = @{ migration = $migObj } | ConvertTo-Json -Depth 6
         Write-Log "Migration plan '$planName': sourceCloud=$sourceCloudId, targetCloud=$MorpheusTargetCloudId, server=$($morphVM.id)"
@@ -1094,6 +1095,12 @@ function Invoke-MorpheusMigration {
                     Write-Log "Migration plan $migrationPlanId was auto-removed by Morpheus — treating as completed." -Level SUCCESS
                     $migrationDone = $true
                     break
+                }
+                # Bearer token may expire during a multi-hour migration; refresh and retry once
+                if ($_.Exception.Message -match '401|Unauthorized') {
+                    Write-Log 'Morpheus bearer token expired during migration poll — refreshing...' -Level WARN
+                    $headers = Get-MorpheusAuthHeaders
+                    continue
                 }
                 throw
             }
@@ -1168,6 +1175,8 @@ function Invoke-MorpheusMigration {
                 Write-Log "Migration plan $migrationPlanId is in 'failed' state — leaving it in the Morpheus UI for inspection. Delete it manually after reviewing the error." -Level WARN
             } else {
                 try {
+                    # Refresh token before rollback — original may have expired during a long migration
+                    $headers = Get-MorpheusAuthHeaders
                     Remove-MorpheusArtifacts -PlanId $migrationPlanId -Headers $headers
                 } catch {
                     $rollbackIssue = $_
@@ -1839,6 +1848,7 @@ $hive    = '__OFFLINE_DRIVE__\Windows\System32\config\SOFTWARE'
 $tempKey = 'HKLM\OFFLINESW_DETECT'
 if (-not (Test-Path $hive)) { Write-Host 'HIVE_NOT_FOUND'; exit 1 }
 reg.exe load $tempKey $hive 2>&1 | Out-Null
+if ($LASTEXITCODE -ne 0) { Write-Host "HIVE_LOAD_FAILED:$LASTEXITCODE"; exit 1 }
 try {
     $cvPath  = 'Registry::HKEY_LOCAL_MACHINE\OFFLINESW_DETECT\Microsoft\Windows NT\CurrentVersion'
     $cv      = Get-ItemProperty -Path $cvPath -ErrorAction Stop
@@ -1861,6 +1871,9 @@ try {
 
     if ($out -match 'HIVE_NOT_FOUND') {
         throw "SOFTWARE hive not found on $OfflineDrive. Cannot auto-detect OS. Use -GuestOSFolder to override."
+    }
+    if ($out -match 'HIVE_LOAD_FAILED') {
+        throw "SOFTWARE hive failed to load on $OfflineDrive. A stale mount from a prior failed run may be present at HKLM\OFFLINESW_DETECT on the helper VM. Reboot the helper VM or remove the key manually with 'reg unload HKLM\OFFLINESW_DETECT'."
     }
     if ($out -notmatch 'HIVE_UNLOADED') {
         throw "SOFTWARE hive did not unload cleanly (HIVE_UNLOAD_FAILED or missing token). A handle may still be open on the target disk. Output: $out"

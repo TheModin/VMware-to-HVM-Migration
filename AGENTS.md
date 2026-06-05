@@ -91,7 +91,8 @@ Reference: [Morpheus Migration API — addMigration](https://apidocs.morpheusdat
 | Completed plans are **auto-deleted** | `GET /api/migrations/{id}` returns 404 after success | Polling treats 404 / "not found" as SUCCESS |
 | No `/cancel` or `/stop` endpoints | Rollback can only use `DELETE /api/migrations/{id}` | `Remove-MorpheusArtifacts` is DELETE-only |
 | Plan field is `servers`, not `vms` | Wrong key → empty migration (plan runs but does nothing) | Always use `servers: [{id: ...}]` |
-| Network mapping: use `networkInterfaces[].destinationNetwork.id` with source NIC `id` fetched from `/api/servers/{id}` | Missing source NIC id → Morpheus NPE at runtime | Fetch server detail before building vmConfig |
+| Network mapping: use plan-level `networks[].{sourceNetwork.id, destinationNetwork.id}` where `sourceNetwork.id` is the backing network ID from `server.interfaces[].network.id` (NOT the NIC id) | Per-server `vmConfig.networkInterfaces` causes Morpheus NPE "Cannot get property 'destinationNetwork' on null object" | Use plan-level `networks` array; fetch source network id from `/api/servers/{id}` interfaces[0].network.id |
+| `targetPool` is always required, even for Private/HVM clouds with no resource pools | Missing targetPool → 400 "targetPool is required" | For Private/HVM clouds, pass a hypervisor host server ID (e.g., mvmHost type) as targetPool |
 | Failed plans are **not** auto-deleted | User can inspect them in **Tools › Migrations** | Do not DELETE a plan already in `failed` state |
 | Execute task endpoint: `POST /api/tasks/{id}/execute` | Execute body needs `{ "job": { "targetType": "instance", "instances": [id] } }` | `Remove-VMwareToolsViaTask` uses this pattern |
 | Task execution ID in `jobExecution.id` (not `execution.id`) | Wrong field → null executionId → poll fails | Extract from `$resp.jobExecution.id` |

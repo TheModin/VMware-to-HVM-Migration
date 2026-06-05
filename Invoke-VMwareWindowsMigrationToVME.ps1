@@ -505,8 +505,6 @@ function Get-OfflineWindowsDrive {
     )
     Write-Log "Searching for Windows OS partition on attached disk..."
     $findScript = (@'
-$systemDrive = $env:SystemDrive.TrimEnd('\')
-
 $targetDisk = Get-Disk -Number __DISK_NUMBER__ -ErrorAction SilentlyContinue
 if (-not $targetDisk) { Write-Host "NODISK"; exit 1 }
 if ($targetDisk.IsOffline -or $targetDisk.OperationalStatus -eq 'Offline') {
@@ -1020,9 +1018,10 @@ function Invoke-MorpheusMigration {
             $srvResp = Invoke-MorpheusRestMethod -Uri "$baseUri/api/servers/$($morphVM.id)" -Method GET -Headers $headers
         }
 
-        # Per-server NIC mapping: Morpheus expects vmConfig.networkInterfaces[].{id, destinationNetwork.id}
-        # where id is the source NIC's own ID (not the backing network ID).
-        # A plan-level 'networks' key is silently ignored by the Morpheus migration engine.
+        # Plan-level network mapping: Morpheus uses sourceNetwork (backing network id from source NIC)
+        # -> destinationNetwork (target network id). Per-server vmConfig.networkInterfaces causes
+        # a server-side NPE ("Cannot get property 'destinationNetwork' on null object").
+        $migObj_networks = $null
         if ($MorpheusTargetNetworkId) {
             $netId = if ($MorpheusTargetNetworkId -match '^\d+$') { [int]$MorpheusTargetNetworkId } else { $MorpheusTargetNetworkId }
             $interfaces = @($srvResp.server.interfaces)
@@ -1030,10 +1029,9 @@ function Invoke-MorpheusMigration {
                 throw "Cannot build network mapping: server $($morphVM.id) has no interfaces in Morpheus. Verify the cloud sync is complete."
             }
             $firstNic = $interfaces[0]
-            $nicId    = [int]$firstNic.id
-            if (-not $serverObj.ContainsKey('vmConfig')) { $serverObj['vmConfig'] = [ordered]@{} }
-            $serverObj['vmConfig']['networkInterfaces'] = @( @{ id = $nicId; destinationNetwork = @{ id = $netId } } )
-            Write-Log "Network mapping: NIC id=$nicId ($($firstNic.network.name)) -> destinationNetwork.id=$netId"
+            $srcNetId = [int]$firstNic.network.id
+            $migObj_networks = @( @{ sourceNetwork = @{ id = $srcNetId }; destinationNetwork = @{ id = $netId } } )
+            Write-Log "Network mapping: sourceNetwork.id=$srcNetId ($($firstNic.network.name)) -> destinationNetwork.id=$netId"
         }
 
         # Plan-level datastores: sourceDatastore (auto-detected from first volume) + destinationDatastore
@@ -1054,10 +1052,11 @@ function Invoke-MorpheusMigration {
             sourceCloud = @{ id = [int]$sourceCloudId }
             targetCloud = @{ id = [int]$MorpheusTargetCloudId }
             servers     = @( $serverObj )
-            targetPool  = @{ id = [int]$MorpheusTargetPoolId }
         }
-        if ($migObj_datastores) { $migObj.datastores  = $migObj_datastores }
-        $planBody = @{ migration = $migObj } | ConvertTo-Json -Depth 6
+        if ($MorpheusTargetPoolId) { $migObj.targetPool = @{ id = [int]$MorpheusTargetPoolId } }
+        if ($migObj_networks)    { $migObj.networks    = $migObj_networks }
+        if ($migObj_datastores)  { $migObj.datastores  = $migObj_datastores }
+        $planBody = @{ migration = $migObj } | ConvertTo-Json -Depth 10
         Write-Log "Migration plan '$planName': sourceCloud=$sourceCloudId, targetCloud=$MorpheusTargetCloudId, server=$($morphVM.id)"
         $createResp = Invoke-MorpheusRestMethod -Uri "$baseUri/api/migrations" -Method POST `
                           -Headers $headers -Body $planBody -ContentType 'application/json'
@@ -1996,20 +1995,32 @@ function Resolve-MorpheusTargetParameters {
                  Where-Object { $_.zone.id -eq [int]$MorpheusTargetCloudId } |
                  Sort-Object name
         if (-not $pools -or $pools.Count -eq 0) {
-            throw ("No resource pools found in Morpheus for cloud $MorpheusTargetCloudId. " +
-                   "Verify that at least one resource pool exists under Infrastructure > Compute > Resource Pools " +
-                   "for the target cloud, or specify -MorpheusTargetPoolId manually.")
-        } elseif ($pools.Count -eq 1) {
+            # Private/HVM clouds have no resource pools — fall back to querying hypervisor hosts.
+            # Morpheus accepts a host server ID as targetPool for Private Cloud migrations.
+            Write-Log "No resource pools for cloud $MorpheusTargetCloudId — querying hypervisor hosts as pool targets..." -Level WARN
+            $hostsResp = Invoke-MorpheusRestMethod `
+                             -Uri "$baseUri/api/servers?zoneId=$MorpheusTargetCloudId&max=100" `
+                             -Method GET -Headers $headers
+            $pools = @($hostsResp.servers |
+                       Where-Object { $_.computeServerType.code -in @('mvmHost','kvmHost','hypervisor') } |
+                       Sort-Object name)
+            if (-not $pools -or $pools.Count -eq 0) {
+                throw ("No resource pools or hypervisor hosts found for cloud $MorpheusTargetCloudId. " +
+                       "Specify -MorpheusTargetPoolId manually (use the hypervisor host ID from Infrastructure > Hosts).")
+            }
+            Write-Log "Using hypervisor host as targetPool (required by Morpheus even for Private/HVM clouds)."
+        }
+        if ($pools.Count -eq 1) {
             # script scope: must mutate across function boundaries
             $script:MorpheusTargetPoolId = [string]$pools[0].id
-            Write-Log "Auto-selected only available pool: $($pools[0].name) (id=$($script:MorpheusTargetPoolId))" -Level SUCCESS
+            Write-Log "Auto-selected only available pool/host: $($pools[0].name) (id=$($script:MorpheusTargetPoolId))" -Level SUCCESS
         } else {
-            $selected = Select-FromList -Items $pools -Prompt "Select target resource pool:" -DisplayScript {
+            $selected = Select-FromList -Items $pools -Prompt "Select target resource pool / host:" -DisplayScript {
                 param($p) "$($p.id): $($p.name)"
             }
             # script scope: must mutate across function boundaries
             $script:MorpheusTargetPoolId = [string]$selected.id
-            Write-Log "Selected resource pool: $($selected.name) (id=$($script:MorpheusTargetPoolId))"
+            Write-Log "Selected pool/host: $($selected.name) (id=$($script:MorpheusTargetPoolId))"
         }
     }
 

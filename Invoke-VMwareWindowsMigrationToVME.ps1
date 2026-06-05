@@ -351,7 +351,7 @@ function Remove-AllSnapshots {
     Write-Log "To cancel and handle snapshots manually, answer anything other than 'YES'." -Level WARN
 
     $confirm = Read-Host "Type 'YES' to confirm snapshot consolidation and continue"
-    if ($confirm -cne 'YES') {
+    if ($confirm -ine 'YES') {
         throw "Snapshot consolidation cancelled. Consolidate or delete snapshots manually in vSphere, then retry."
     }
 
@@ -985,7 +985,31 @@ function Invoke-MorpheusMigration {
         $encodedName = [uri]::EscapeDataString($TargetVM.Name)
         $searchResp = Invoke-MorpheusRestMethod -Uri "$baseUri/api/servers?name=$encodedName&max=10" `
                           -Method GET -Headers $headers
-        $morphVM = $searchResp.servers | Where-Object { $_.name -eq $TargetVM.Name } | Select-Object -First 1
+        $allMatches = @($searchResp.servers | Where-Object { $_.name -eq $TargetVM.Name })
+
+        # When multiple records exist (e.g. VM migrated before — one in vCenter cloud,
+        # one in HVM cloud), prefer the vCenter/VMware source record to avoid building
+        # a migration plan against a stale HVM moref which causes a SOAP fault in vCenter.
+        # Priority: 1) externalId looks like vSphere moref (vm-\d+)
+        #           2) zone/cloud name contains 'vcenter' or 'vmware'
+        #           3) first match (original behaviour, with a warning)
+        $morphVM = $allMatches | Where-Object {
+            $_.PSObject.Properties['externalId'] -and $_.externalId -match '^vm-\d+$'
+        } | Select-Object -First 1
+
+        if ($null -eq $morphVM) {
+            $morphVM = $allMatches | Where-Object {
+                $zoneName = if ($_.PSObject.Properties['zone'] -and $_.zone) { $_.zone.name } `
+                            elseif ($_.PSObject.Properties['cloud'] -and $_.cloud) { $_.cloud.name } else { '' }
+                $zoneName -imatch 'vcenter|vmware'
+            } | Select-Object -First 1
+        }
+
+        if ($null -eq $morphVM -and $allMatches.Count -gt 0) {
+            Write-Log "Multiple Morpheus records found for '$($TargetVM.Name)' but none matched vCenter heuristics — using first result." -Level WARN
+            $morphVM = $allMatches[0]
+        }
+
         if ($null -eq $morphVM) {
             throw ("'$($TargetVM.Name)' was not found in Morpheus. " +
                    'Ensure the VMware cloud integration has discovered this VM in the Morpheus UI.')
@@ -996,7 +1020,11 @@ function Invoke-MorpheusMigration {
         } elseif ($morphVM.PSObject.Properties['zone'] -and $morphVM.zone) {
             $cloudInfo = $morphVM.zone.name
         }
-        Write-Log "Found in Morpheus: id=$($morphVM.id), cloud=$cloudInfo" -Level SUCCESS
+        if ($allMatches.Count -gt 1) {
+            Write-Log "Found $($allMatches.Count) Morpheus records for '$($TargetVM.Name)' — selected id=$($morphVM.id) (externalId=$($morphVM.externalId), cloud=$cloudInfo)." -Level WARN
+        } else {
+            Write-Log "Found in Morpheus: id=$($morphVM.id), cloud=$cloudInfo" -Level SUCCESS
+        }
 
         # --- Step 3: Create migration plan ---
         $sourceCloudId = $null

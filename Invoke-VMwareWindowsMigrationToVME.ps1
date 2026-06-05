@@ -2332,8 +2332,8 @@ try {
     Remove-AllSnapshots -VM $targetVM
 
     Write-Log "Identifying OS disk for $($targetVM.Name) across all attached VMDKs..."
-    $candidateDisks = Get-HardDisk -VM $targetVM |
-        Sort-Object @{Expression = { $_.ExtensionData.ControllerKey }}, @{Expression = { $_.ExtensionData.UnitNumber }}
+    $candidateDisks = @(Get-HardDisk -VM $targetVM |
+        Sort-Object @{Expression = { $_.ExtensionData.ControllerKey }}, @{Expression = { $_.ExtensionData.UnitNumber }})
 
     if (-not $candidateDisks -or $candidateDisks.Count -eq 0) {
         throw "No hard disks found on target VM $($targetVM.Name)."

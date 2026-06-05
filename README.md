@@ -102,8 +102,9 @@ sequenceDiagram
 - **Accurate OS Build Detection**: Avoids unreliable vCenter guest metadata. It temporarily mounts the target's offline `SOFTWARE` registry hive to query the actual Windows build number, mapping it precisely to the correct VirtIO driver folder (e.g. Server 2025 vs. 2022).
 - **Offline Registry Remediation**: Sets driver start values directly in the offline control set (`Start=0`), ensuring Windows recognizes the boot devices immediately upon startup.
 - **Pure Local Guest-Tools Staging**: By default the script performs a zero-network-hop, local VMDK copy of the guest tools onto the mounted target disk. Once the VM boots, the script executes the installer silently. Use `-DoNotInstallGuestTools` to skip this behaviour.
-- **Automatic VMware Tools Removal**: After the VM is successfully migrated to HVM, the script automatically removes VMware Tools from the running HVM instance. It first enables WinRM on the source VM (pre-migration) as the management channel, then post-migration it attempts to install the Morpheus agent (via WinRM) and remove tools via a Morpheus task. If the agent path is unavailable, it falls back to direct `Invoke-Command` over WinRM. Use `-DoNotRemoveVMwareTools` to skip this step entirely.
+- **Automatic VMware Tools Removal**: After the VM is successfully migrated to HVM, the script automatically removes VMware Tools from the running HVM instance. When VMware Tools removal is enabled (default), the script pre-enables WinRM on the source VM before migration to establish the post-migration management channel. It then attempts to install the Morpheus agent (via WinRM) and remove tools via a Morpheus task. If the agent path is unavailable, it falls back to direct `Invoke-Command` over WinRM. Use `-DoNotRemoveVMwareTools` to skip this step entirely. If skipped, WinRM is not pre-enabled.
 - **End-to-End Morpheus HVM Integration**: Gracefully shuts down the prepared VM, connects to the Morpheus REST API (supporting standard auth or secure bearer tokens), creates a migration plan targeting your HVM Cloud, starts it, and polls until import is complete.
+- **Multi-Disk OS Detection**: The script iterates through all hard disks attached to the target VM (sorted by controller key and unit number) and probes each one to locate the Windows OS partition. On VMs with many data disks (e.g. SQL servers), this scan may take additional time. If no OS disk is found, the script throws a clear error — use `-GuestOSFolder` to bypass auto-detection if needed.
 - **Enterprise Safety Nets**: Automatically detects and consolidates target VM snapshots before mounting (required to release file locks on the base disk) and creates a safety rollback snapshot before the first boot test.
 
 ---
@@ -194,7 +195,18 @@ C:\Drivers\virtio-win\
 
 ---
 
-## Usage Examples
+## Operational Modes
+
+The script supports four distinct execution modes. Choose based on where you are in the migration lifecycle.
+
+| Mode | Required Switches | When to Use |
+| :--- | :--- | :--- |
+| **Full Migration** (default) | *(none — all phases run)* | Fresh VM: inject VirtIO drivers offline → verify boot → migrate to HVM |
+| **Migration Only** | `-MigrationOnly -TriggerMorpheusMigration` | VM already has VirtIO drivers from a previous run. Skips injection and goes straight to the Morpheus migration plan. |
+| **Create Plan Only** | `-TriggerMorpheusMigration -CreatePlanOnly` | Dry-run: builds and saves the Morpheus migration plan without starting it. Review the plan in **Tools › Migrations** before committing. |
+| **Post-Migration Only** | `-PostMigrationOnly -MorpheusInstanceId <id>` | VM already migrated. Re-runs post-migration cleanup (Morpheus agent install + VMware Tools removal) against an existing Morpheus instance. Does not require a vCenter connection. |
+
+---
 
 ### 1. Interactive Mode — Let the Script Discover Everything
 Provide only credentials and switches. The script will query vCenter and Morpheus and present numbered menus to select the target VM, helper VM, network, cloud, and datastore.
@@ -272,6 +284,37 @@ If the full migration ran but post-migration cleanup (Morpheus agent install + V
   -TargetVMUser "Administrator" `
   -TargetVMPassword "TargetPass!" `
   -MorpheusSkipSSL
+```
+
+### 6. Migration Only (Drivers Already Injected)
+The target VM has already had VirtIO drivers injected in a prior run. Skip the helper VM loop entirely and go straight to the Morpheus migration.
+```powershell
+.\Invoke-VMwareWindowsMigrationToVME.ps1 `
+  -VCServer vcsa.company.local `
+  -TargetVMName "WIN2022-APP" `
+  -MigrationOnly `
+  -TriggerMorpheusMigration `
+  -MorpheusServer "morpheus.company.local" `
+  -MorpheusToken (ConvertTo-SecureString "a50c822e-1ff2-4b2a-8742-1e9a7e02df5b" -AsPlainText -Force) `
+  -MorpheusTargetCloudId "5" `
+  -MorpheusSkipSSL `
+  -VCSkipSSL
+```
+
+### 7. Create Plan Only (Dry-Run Preview)
+Build the Morpheus migration plan and print its ID without starting the migration. Review the plan in the Morpheus UI under **Tools › Migrations** before committing.
+```powershell
+.\Invoke-VMwareWindowsMigrationToVME.ps1 `
+  -VCServer vcsa.company.local `
+  -TargetVMName "WIN2025-SQL" `
+  -TriggerMorpheusMigration `
+  -CreatePlanOnly `
+  -MorpheusServer "morpheus.company.local" `
+  -MorpheusToken (ConvertTo-SecureString "a50c822e-1ff2-4b2a-8742-1e9a7e02df5b" -AsPlainText -Force) `
+  -MorpheusTargetCloudId "5" `
+  -MorpheusTargetNetworkId "22" `
+  -MorpheusSkipSSL `
+  -VCSkipSSL
 ```
 
 ---

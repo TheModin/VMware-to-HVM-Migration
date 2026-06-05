@@ -83,7 +83,7 @@
 #   MorpheusMigrationTimeoutHours - Hours to wait for migration to complete (default 4)
 #
 # Example:
-#   .\Invoke-HelperVMVirtIOInject.ps1 `
+#   .\Invoke-VMwareWindowsMigrationToVME.ps1 `
 #     -VCServer vcsa01.lab.local `
 #     -TargetVMName WIN2025-APP01 `
 #     -HelperVMName HELPER-WIN01 `

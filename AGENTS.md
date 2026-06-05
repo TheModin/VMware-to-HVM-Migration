@@ -26,12 +26,13 @@ Must print `PARSE_OK`. Fix any errors before running the script.
 
 | Region | Lines (approx) | Purpose |
 |--------|----------------|---------|
-| `param(...)` | 93–128 | All script parameters |
-| Validation block | 130–220 | PS7 gate, PowerCLI check, param dependency checks |
-| Helper functions | 230–2062 | All named functions (do not touch order) |
-| Main execution block | 2064–end | PostMigrationOnly fast-path, vCenter connect, full migration flow |
+| `param(...)` | 94–146 | All script parameters |
+| Validation block | 148–259 | PS7 gate, PowerCLI check, param dependency checks |
+| Helper functions | 151–2143 | All named functions (do not touch order) |
+| Main execution block | 2147–end | PostMigrationOnly fast-path, vCenter connect, full migration flow |
 
 Key functions:
+- `Connect-VC` — wraps PowerCLI `Connect-VIServer` with `VCSkipSSL` and optional credential pass-through
 - `Invoke-MorpheusMigration` — all Morpheus API logic (Steps 1–5)
 - `Get-VirtIOGuestOSFolder` — offline hive OS detection
 - `Enable-AttachedDiskOnHelper` / `Disable-AttachedDiskOnHelper` — helper VM disk management
@@ -39,7 +40,11 @@ Key functions:
 - `Remove-VMwareToolsViaTask` — Morpheus agent task execution for VMware Tools removal
 - `Remove-VMwareToolsViaWinRM` — direct WinRM fallback for VMware Tools removal
 - `Install-MorpheusAgent` — Morpheus agent installation via WinRM
+- `Set-MorpheusInstanceCredentials` — sets SSH/WinRM credentials on the Morpheus server record so agent finalize connects with the correct OS admin account
 - `Invoke-PostMigrationVMwareToolsRemoval` — orchestrates post-migration cleanup
+- `Select-FromList` — shared numbered console menu utility used by both Resolve- functions
+- `Resolve-MorpheusTargetParameters` — interactive selection menus for Cloud, Pool, Network, and Datastore
+- `Resolve-VCenterTargetParameters` — interactive selection menus for TargetVMName, HelperVMName, and VirtIODriverPath
 
 ---
 
@@ -71,7 +76,9 @@ if ($KnownDiskNumbers) { ... }               # WRONG — @(0) is falsy
 ```
 
 ### Password handling
-Never accept raw strings without routing through `ConvertTo-SecurePassword`. The helper accepts `string | SecureString | PSCredential` (parameter typed as `[object]` to allow all three).
+`HelperVMPassword` and `TargetVMPassword` are typed `[object]` and always routed through `ConvertTo-SecurePassword`, which accepts `string | SecureString | PSCredential`. Never accept raw strings for these without routing through that helper.
+
+`MorpheusToken` and `MorpheusPassword` are typed `[System.Security.SecureString]` and do **not** go through `ConvertTo-SecurePassword` — callers must pass them as SecureStrings directly (e.g. `ConvertTo-SecureString "value" -AsPlainText -Force`).
 
 ---
 
@@ -102,5 +109,5 @@ See [CONTRIBUTING.md](CONTRIBUTING.md#extending-os-support) — requires updatin
 
 ## PowerShell Requirement
 
-The script enforces **PowerShell 7.0+** at runtime (line ~136). Do not use PS5-only syntax (e.g., `??` operator alternative forms, `ForEach-Object -Parallel`).  
+The script enforces **PowerShell 7.0+** at runtime (line ~171). Do not use PS5-only syntax (e.g., `??` operator alternative forms, `ForEach-Object -Parallel`).  
 `SkipCertificateCheck` on `Invoke-RestMethod` is PS7-only — used intentionally.

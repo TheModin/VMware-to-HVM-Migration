@@ -96,10 +96,62 @@ Morpheus VM Essentials API endpoints can slightly vary across release versions. 
 1. **SSL Verification**: If your Morpheus appliance uses a self-signed certificate, make sure to pass the `-MorpheusSkipSSL` switch.
 2. **Validate Cloud ID**: Ensure the `-MorpheusTargetCloudId` is correct. You can find this in Morpheus under **Infrastructure > Clouds** (or hover over the cloud in the UI to see its database ID in the URL, or query the `/api/clouds` API endpoint).
 3. **Check Local Swagger**: If you encounter `404 Not Found` on `/api/migrations` or `/api/servers`, open the Swagger documentation on your Morpheus appliance at `https://<MorpheusServer>/api/swagger.json` to verify endpoint syntax.
+4. **Long-running migrations and token expiry**: Morpheus bearer tokens have a finite lifetime. If a migration runs longer than the token validity period, the script automatically detects the `401 Unauthorized` response and refreshes the token transparently. If the token refresh itself fails (e.g. the credentials are no longer valid), the script will throw. Ensure your Morpheus credentials remain valid for the duration of the migration.
 
 ---
 
-## 6. Target VM Blue Screen on First Boot
+## 6. WinRM Connection Failures Post-Migration
+
+### Symptom:
+The post-migration cleanup step fails with:
+`"WinRM connection failed"` or `"Access denied"` errors when connecting to the migrated HVM instance.
+
+### Explanation:
+The post-migration cleanup (Morpheus agent install + VMware Tools removal) connects to the HVM instance via WinRM using the `-TargetVMUser` / `-TargetVMPassword` credentials. Several things can prevent this:
+- The VM's IP address in Morpheus has not yet refreshed from the VMware-era address to the new KVM address.
+- WinRM was not enabled on the source VM before migration (the script enables it automatically when `-DoNotRemoveVMwareTools` is not set, but if the pre-migration WinRM step failed, it will not be available post-migration).
+- Windows Firewall on the migrated VM is blocking WinRM ports (5985/5986).
+
+### Resolution:
+1. **Verify IP address**: Check the migrated instance's IP in the Morpheus UI. If it still shows the old VMware-era IP, wait for the next Morpheus cloud sync or trigger a manual refresh in the UI.
+2. **Enable WinRM manually**: If WinRM was not pre-enabled, connect to the HVM instance via the Morpheus console or RDP and run `Enable-PSRemoting -Force` in an elevated PowerShell session.
+3. **Re-run post-migration only**: Once WinRM is accessible, use `-PostMigrationOnly -MorpheusInstanceId <id>` to re-run cleanup without repeating the full migration.
+
+---
+
+## 7. Source VM Left Powered Off After Migration Failure
+
+### Symptom:
+A migration failed mid-way, and the source VM is now powered off in vSphere. The script has exited with an error.
+
+### Explanation:
+The migration workflow shuts down the source VM before triggering the Morpheus migration plan. If the migration fails after shutdown, the script attempts to automatically restart the source VM to restore accessibility. If the restart also fails (or if `-SkipRollbackRestart` was passed), the VM remains powered off.
+
+### Resolution:
+1. **Check the Morpheus UI**: Navigate to **Tools › Migrations** and review the failed plan for error details before attempting recovery.
+2. **Power on manually**: If the source VM did not restart automatically, power it on in vCenter.
+3. **Avoid re-running immediately**: If the migration plan is in `failed` state in Morpheus, do not delete it yet — it provides useful diagnostics. The script will not attempt to delete a plan already in `failed` state.
+4. **Re-attempt migration**: Once the source VM is healthy, use `-MigrationOnly -TriggerMorpheusMigration` to retry only the Morpheus migration phase (skipping VirtIO re-injection).
+
+---
+
+## 8. Multi-Disk VM — OS Disk Not Found
+
+### Symptom:
+The script fails with an error during the disk probing phase:
+`"Could not identify the offline Windows OS disk"` or the drive letter scan reports `NOTFOUND` across all probed disks.
+
+### Explanation:
+On VMs with many data disks (e.g. SQL servers), the script iterates through all attached disks to find the one containing `Windows\System32\config\SYSTEM`. Encrypted disks (BitLocker) and dynamic disk volumes will not pass detection.
+
+### Resolution:
+1. **Check BitLocker**: Ensure the system disk is **not** BitLocker-encrypted before migration. The Helper VM cannot read a locked BitLocker volume.
+2. **Simplify disk layout**: As a diagnostic step, temporarily detach non-OS data disks from the target VM before running the script, then re-attach after migration.
+3. **Override auto-detection**: Pass `-GuestOSFolder <folder>` (e.g. `-GuestOSFolder 2k25`) to skip the offline hive OS detection entirely and use the specified VirtIO folder directly.
+
+---
+
+## 9. Target VM Blue Screen on First Boot
 
 ### Symptom:
 The target VM boot verification times out, and connecting to the VMware Console shows an `INACCESSIBLE_BOOT_DEVICE` Blue Screen (BSOD).

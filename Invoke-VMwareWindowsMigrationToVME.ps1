@@ -752,9 +752,10 @@ function Enable-WinRMOnTarget {
     #
     # Steps performed inside the guest:
     #   1. Enable-PSRemoting -Force
-    #   2. Open WinRM HTTP on Domain/Private profiles only (port 5985)
-    #   3. Open WinRM HTTPS (port 5986)
-    #   4. Enable Negotiate auth; disable Basic auth
+    #   2. Set all network profiles to Private (prevents Public-profile WinRM block post-migration)
+    #   3. Open WinRM HTTP on all profiles (port 5985)
+    #   4. Open WinRM HTTPS on all profiles (port 5986)
+    #   5. Enable Negotiate auth; disable Basic auth
     #   NLA (Network Level Authentication) is intentionally left enabled for security.
     param($TargetVM)
 
@@ -764,9 +765,14 @@ function Enable-WinRMOnTarget {
     $winrmScript = @'
 $ErrorActionPreference = 'Stop'
 Enable-PSRemoting -Force
-# Open WinRM HTTP only on Domain and Private profiles — not Public
-New-NetFirewallRule -DisplayName 'WinRM HTTP (Domain/Private)' -Direction Inbound -Protocol TCP -LocalPort 5985 -Action Allow -Profile Domain,Private -ErrorAction SilentlyContinue
-New-NetFirewallRule -DisplayName 'WinRM HTTPS' -Direction Inbound -Protocol TCP -LocalPort 5986 -Action Allow -ErrorAction SilentlyContinue
+# Set all current network profiles to Private. When Windows detects a new network
+# adapter after migration (HVM VLAN), NLA may classify it as Public, which blocks
+# WinRM outside the local subnet. Setting Private here carries over as the NLA hint.
+Get-NetConnectionProfile | Set-NetConnectionProfile -NetworkCategory Private -ErrorAction SilentlyContinue
+# Open WinRM on all profiles (Any) so it remains accessible after migration
+# even if the new HVM network adapter is assigned a Public profile.
+New-NetFirewallRule -DisplayName 'WinRM HTTP' -Direction Inbound -Protocol TCP -LocalPort 5985 -Action Allow -Profile Any -ErrorAction SilentlyContinue
+New-NetFirewallRule -DisplayName 'WinRM HTTPS' -Direction Inbound -Protocol TCP -LocalPort 5986 -Action Allow -Profile Any -ErrorAction SilentlyContinue
 Set-WSManInstance -ResourceURI winrm/config/service/auth -ValueSet @{Negotiate=$true}
 Set-WSManInstance -ResourceURI winrm/config/service/auth -ValueSet @{Basic=$false}
 Write-Host 'WINRM_ENABLED'

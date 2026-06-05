@@ -98,6 +98,13 @@ param(
     [string]$HelperVMName = '',
     [string]$HelperVMUser = '',
     [System.Security.SecureString]$HelperVMPassword = $null,
+    [ValidateScript({
+        if ([string]::IsNullOrWhiteSpace($_)) { return $true }
+        if ($_ -notmatch '^[A-Za-z]:\\') { throw "VirtIODriverPath must be an absolute Windows path (e.g. C:\Drivers\virtio-win). Got: '$_'" }
+        if ($_ -match '\.\.')            { throw "VirtIODriverPath must not contain '..'. Got: '$_'" }
+        if ($_ -match "[';`"&|<>]")      { throw "VirtIODriverPath must not contain shell-special characters. Got: '$_'" }
+        return $true
+    })]
     [string]$VirtIODriverPath = '',
     [ValidateSet('2k25','2k22','2k19','2k16','2k12R2','w11','w10')][string]$GuestOSFolder = '',  # blank = auto-detect from offline SOFTWARE hive on the target disk
     [string]$SnapshotName = 'Post-VirtIO-Injection',
@@ -110,8 +117,14 @@ param(
     [switch]$DoNotRemoveVMwareTools,
     [switch]$DoNotEnableRDP,
     [switch]$TriggerMorpheusMigration,
+    [ValidateScript({
+        if ([string]::IsNullOrWhiteSpace($_)) { return $true }
+        if ($_ -match '^https?://')  { throw "MorpheusServer must be a hostname or IP only — do not include 'https://'. Got: '$_'" }
+        if ($_ -match '[/\\?#]')     { throw "MorpheusServer must be a plain hostname or IP with no path or query. Got: '$_'" }
+        return $true
+    })]
     [string]$MorpheusServer,
-    [string]$MorpheusToken,
+    [System.Security.SecureString]$MorpheusToken,
     [string]$MorpheusUser,
     [System.Security.SecureString]$MorpheusPassword,
     [string]$MorpheusTargetCloudId,
@@ -119,6 +132,10 @@ param(
     [string]$MorpheusTargetStoreId,
     [string]$MorpheusTargetPoolId,
     [switch]$MorpheusSkipSSL,
+    [switch]$VCSkipSSL,
+    [switch]$WinRMSkipSSL,
+    [string]$VCUser = '',
+    [System.Security.SecureString]$VCPassword = $null,
     [int]$MorpheusMigrationTimeoutHours = 4,
     [switch]$MigrationOnly,
     [switch]$SkipRollbackRestart,
@@ -130,26 +147,15 @@ param(
 
 function ConvertTo-SecurePassword {
     param(
-        [Parameter(Mandatory)][AllowNull()][System.Security.SecureString]$Password
+        [Parameter(Mandatory)][AllowNull()][object]$Password
     )
 
-    if ($null -eq $Password) {
-        return $null
-    }
+    if ($null -eq $Password)                                                { return $null }
+    if ($Password -is [System.Security.SecureString])                       { return $Password }
+    if ($Password -is [System.Management.Automation.PSCredential])          { return $Password.Password }
+    if ($Password -is [string])  { return ConvertTo-SecureString $Password -AsPlainText -Force }
 
-    if ($Password -is [System.Security.SecureString]) {
-        return $Password
-    }
-
-    if ($Password -is [System.Management.Automation.PSCredential]) {
-        return $Password.Password
-    }
-
-    if ($Password -is [string]) {
-        return ConvertTo-SecureString $Password -AsPlainText -Force
-    }
-
-    throw 'Password parameter must be a string, SecureString, or PSCredential.'
+    throw "Password must be a [string], [SecureString], or [PSCredential]. Got: $($Password.GetType().FullName)"
 }
 
 if ($HelperVMPassword) { $HelperVMPassword = ConvertTo-SecurePassword -Password $HelperVMPassword }
@@ -232,7 +238,25 @@ if ($TriggerMorpheusMigration) {
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-if (-not (Test-Path $LogPath)) { New-Item -ItemType Directory -Path $LogPath | Out-Null }
+if ($MorpheusSkipSSL) {
+    Write-Host '[WARN] -MorpheusSkipSSL is set. TLS certificate validation is DISABLED for all Morpheus API calls. Do not use in production.' -ForegroundColor Yellow
+}
+if ($VCSkipSSL) {
+    Write-Host '[WARN] -VCSkipSSL is set. vCenter TLS certificate validation is DISABLED. Do not use in production.' -ForegroundColor Yellow
+}
+if ($WinRMSkipSSL) {
+    Write-Host '[WARN] -WinRMSkipSSL is set. WinRM TLS certificate validation is DISABLED. Do not use in production.' -ForegroundColor Yellow
+}
+
+if (-not (Test-Path $LogPath)) {
+    New-Item -ItemType Directory -Path $LogPath | Out-Null
+    $acl = Get-Acl $LogPath
+    $acl.SetAccessRuleProtection($true, $false)
+    $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+        'BUILTIN\Administrators', 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
+    $acl.AddAccessRule($rule)
+    Set-Acl $LogPath $acl
+}
 $LogFile = Join-Path $LogPath "HelperVirtIO_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
 
 function Write-Log {
@@ -250,9 +274,19 @@ function Write-Log {
 
 function Connect-VC {
     Write-Log "Loading PowerCLI and connecting to $VCServer..."
-    Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Scope Session -Confirm:$false | Out-Null
-    Connect-VIServer -Server $VCServer | Out-Null
-    Write-Log "Connected to vCenter." -Level SUCCESS
+    $certAction = if ($VCSkipSSL) { 'Ignore' } else { 'Fail' }
+    if ($VCSkipSSL) {
+        Write-Log 'WARNING: -VCSkipSSL is set. vCenter TLS certificate validation is DISABLED. Do not use in production.' -Level WARN
+    }
+    Set-PowerCLIConfiguration -InvalidCertificateAction $certAction -Scope Session -Confirm:$false | Out-Null
+    if ($VCUser -and $VCPassword) {
+        $vcCred = New-Object System.Management.Automation.PSCredential($VCUser, $VCPassword)
+        Connect-VIServer -Server $VCServer -Credential $vcCred | Out-Null
+        Write-Log "Connected to vCenter as '$VCUser'." -Level SUCCESS
+    } else {
+        Connect-VIServer -Server $VCServer | Out-Null
+        Write-Log "Connected to vCenter." -Level SUCCESS
+    }
 }
 
 function Stop-VMGracefully {
@@ -263,7 +297,7 @@ function Stop-VMGracefully {
     }
     Write-Log "Requesting graceful shutdown of $($VM.Name)..."
     try { Shutdown-VMGuest -VM $VM -Confirm:$false -ErrorAction Stop | Out-Null } catch {
-        Write-Log "Guest shutdown failed (VMware Tools may not be running): $_" -Level WARN
+        Write-Log "Guest shutdown failed (VMware Tools may not be running): $($_.Exception.Message)" -Level WARN
     }
     $deadline = (Get-Date).AddMinutes($ForceHardStopMin)
     while ((Get-Date) -lt $deadline) {
@@ -722,12 +756,11 @@ function Enable-WinRMOnTarget {
     $winrmScript = @'
 $ErrorActionPreference = 'Stop'
 Enable-PSRemoting -Force
-Enable-NetFirewallRule -Name 'WINRM-HTTP-In-TCP-PUBLIC' -ErrorAction SilentlyContinue
-New-NetFirewallRule -DisplayName 'WinRM HTTP' -Direction Inbound -Protocol TCP -LocalPort 5985 -Action Allow -ErrorAction SilentlyContinue
+# Open WinRM HTTP only on Domain and Private profiles — not Public
+New-NetFirewallRule -DisplayName 'WinRM HTTP (Domain/Private)' -Direction Inbound -Protocol TCP -LocalPort 5985 -Action Allow -Profile Domain,Private -ErrorAction SilentlyContinue
 New-NetFirewallRule -DisplayName 'WinRM HTTPS' -Direction Inbound -Protocol TCP -LocalPort 5986 -Action Allow -ErrorAction SilentlyContinue
-Set-WSManInstance -ResourceURI winrm/config/service/auth -ValueSet @{Basic=$true}
 Set-WSManInstance -ResourceURI winrm/config/service/auth -ValueSet @{Negotiate=$true}
-Set-WSManInstance -ResourceURI winrm/config/service -ValueSet @{AllowUnencrypted=$true}
+Set-WSManInstance -ResourceURI winrm/config/service/auth -ValueSet @{Basic=$false}
 Write-Host 'WINRM_ENABLED'
 '@
     try {
@@ -739,7 +772,7 @@ Write-Host 'WINRM_ENABLED'
         }
         Write-Log "WinRM enabled on $($TargetVM.Name)." -Level SUCCESS
     } catch {
-        Write-Log "WinRM enablement failed on $($TargetVM.Name) (non-fatal, migration will continue): $_" -Level WARN
+        Write-Log "WinRM enablement failed on $($TargetVM.Name) (non-fatal, migration will continue): $($_.Exception.Message)" -Level WARN
         Write-Log "Post-migration VMware Tools removal via WinRM may not be available." -Level WARN
     }
 }
@@ -754,7 +787,7 @@ function Enable-RDPOnTarget {
     # Steps performed inside the guest:
     #   1. Allow RDP connections (fDenyTSConnections = 0)
     #   2. Enable the Remote Desktop firewall rule group
-    #   3. Disable NLA (UserAuthentication = 0) so RDP works without domain context
+    #   NLA (Network Level Authentication) is intentionally left enabled for security.
     param($TargetVM)
 
     $targetCred = New-Object System.Management.Automation.PSCredential($TargetVMUser, $TargetVMPassword)
@@ -764,7 +797,6 @@ function Enable-RDPOnTarget {
 $ErrorActionPreference = 'Stop'
 Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0
 Enable-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue
-Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name UserAuthentication -Value 0
 Write-Host 'RDP_ENABLED'
 '@
     try {
@@ -776,7 +808,7 @@ Write-Host 'RDP_ENABLED'
         }
         Write-Log "Remote Desktop enabled on $($TargetVM.Name)." -Level SUCCESS
     } catch {
-        Write-Log "RDP enablement failed on $($TargetVM.Name) (non-fatal, migration will continue): $_" -Level WARN
+        Write-Log "RDP enablement failed on $($TargetVM.Name) (non-fatal, migration will continue): $($_.Exception.Message)" -Level WARN
         Write-Log "Post-migration Remote Desktop access may require manual configuration." -Level WARN
     }
 }
@@ -806,14 +838,14 @@ function Invoke-MorpheusRestMethod {
     try {
         return Invoke-RestMethod @invokeParams
     } catch {
-        # Auto-detect SSL certificate errors and retry once with cert check disabled.
-        # This avoids requiring -MorpheusSkipSSL explicitly for self-signed cert environments.
+        # If this looks like a certificate error and -MorpheusSkipSSL was not set,
+        # fail with a clear message rather than silently downgrading TLS security.
         $isCertError = $_.Exception.Message -match 'certificate|UntrustedRoot|RemoteCertificate|SSL'
         if ($isCertError -and -not $MorpheusSkipSSL) {
-            Write-Log "SSL certificate validation failed — enabling SkipCertificateCheck for this session and retrying. Pass -MorpheusSkipSSL to suppress this message." -Level WARN
-            $script:MorpheusSkipSSL = $true
-            $invokeParams.SkipCertificateCheck = $true
-            return Invoke-RestMethod @invokeParams
+            throw ("SSL certificate validation failed for '$Uri'. " +
+                   "If your Morpheus server uses a self-signed certificate, " +
+                   "re-run the script with -MorpheusSkipSSL. " +
+                   "Original error: $($_.Exception.Message)")
         }
         throw
     }
@@ -823,13 +855,30 @@ function Get-MorpheusAuthHeaders {
     # Obtains a Morpheus API bearer token (or reuses $MorpheusToken if provided)
     # and returns a headers hashtable ready for use with Invoke-MorpheusRestMethod.
     $baseUri = "https://$MorpheusServer"
-    $token = $MorpheusToken
+    $token = $null
+
+    if ($MorpheusToken) {
+        # Decrypt SecureString only at the moment of use; zero the unmanaged BSTR copy immediately.
+        $bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($MorpheusToken)
+        try {
+            $token = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
+        } finally {
+            [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+        }
+    }
+
     if (-not $token) {
         Write-Log "Obtaining Morpheus API token for user '$MorpheusUser'..."
-        $morpheusPasswordPlain = [System.Net.NetworkCredential]::new('', $MorpheusPassword).Password
-        $authBody = "username=$([uri]::EscapeDataString($MorpheusUser))" +
-                    "&password=$([uri]::EscapeDataString($morpheusPasswordPlain))" +
-                    "&grant_type=password&client_id=morph-api"
+        $bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($MorpheusPassword)
+        try {
+            $morpheusPasswordPlain = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
+            $authBody = "username=$([uri]::EscapeDataString($MorpheusUser))" +
+                        "&password=$([uri]::EscapeDataString($morpheusPasswordPlain))" +
+                        "&grant_type=password&client_id=morph-api"
+        } finally {
+            [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+            Remove-Variable -Name morpheusPasswordPlain -ErrorAction SilentlyContinue
+        }
         $authResp = Invoke-MorpheusRestMethod -Uri "$baseUri/oauth/token" -Method POST `
                         -Body $authBody -ContentType 'application/x-www-form-urlencoded'
         $token = $authResp.access_token
@@ -861,7 +910,7 @@ function Get-MorpheusInstanceIdByName {
             }
             Write-Log "Instance '$Name' not yet visible in Morpheus (attempt $($i+1)/$RetryCount). Retrying in ${RetryDelaySec}s..." -Level WARN
         } catch {
-            Write-Log "Error looking up instance '$Name': $_ — retrying in ${RetryDelaySec}s..." -Level WARN
+            Write-Log "Error looking up instance '$Name': $($_.Exception.Message) — retrying in ${RetryDelaySec}s..." -Level WARN
         }
         if ($i -lt $RetryCount - 1) { Start-Sleep -Seconds $RetryDelaySec }
     }
@@ -980,16 +1029,15 @@ function Invoke-MorpheusMigration {
         if ($migObj_networks)   { $migObj.networks   = $migObj_networks }
         if ($migObj_datastores) { $migObj.datastores  = $migObj_datastores }
         $planBody = @{ migration = $migObj } | ConvertTo-Json -Depth 6
-        Write-Log "Plan body: $planBody"
+        Write-Log "Migration plan '$planName': sourceCloud=$sourceCloudId, targetCloud=$MorpheusTargetCloudId, server=$($morphVM.id)"
         $createResp = Invoke-MorpheusRestMethod -Uri "$baseUri/api/migrations" -Method POST `
                           -Headers $headers -Body $planBody -ContentType 'application/json'
         $migrationPlanId = $createResp.migration.id
         Write-Log "Migration plan created: id=$migrationPlanId" -Level SUCCESS
 
-        # Log the saved plan back from Morpheus so we can verify what was stored
-        Write-Log 'Querying saved plan from Morpheus to verify stored configuration...'
+        # Verify the plan was stored correctly by fetching just the key fields
         $savedPlan = Invoke-MorpheusRestMethod -Uri "$baseUri/api/migrations/$migrationPlanId" -Method GET -Headers $headers
-        Write-Log "Saved plan response: $($savedPlan | ConvertTo-Json -Depth 8)"
+        Write-Log "Plan verified: id=$($savedPlan.migration.id), status=$($savedPlan.migration.status)"
 
         if ($CreatePlanOnly) {
             Write-Log "CreatePlanOnly: plan $migrationPlanId created and logged. Not starting. Inspect it in Morpheus UI under Tools > Migrations." -Level WARN
@@ -1183,11 +1231,11 @@ function Wait-ForMorpheusInstance {
                     Invoke-MorpheusRestMethod -Uri "$baseUri/api/instances/$InstanceId/start" `
                         -Method PUT -Headers $Headers | Out-Null
                 } catch {
-                    Write-Log "Could not start instance ${InstanceId}: $_" -Level WARN
+                    Write-Log "Could not start instance ${InstanceId}: $($_.Exception.Message)" -Level WARN
                 }
             }
         } catch {
-            Write-Log "Error polling instance ${InstanceId}: $_ — retrying..." -Level WARN
+            Write-Log "Error polling instance ${InstanceId}: $($_.Exception.Message) — retrying..." -Level WARN
         }
     }
     Write-Log ("Timed out after $TimeoutMinutes min waiting for IP on instance $InstanceId. " +
@@ -1277,6 +1325,7 @@ function Set-MorpheusInstanceCredentials {
     $serverId = $serverIds[0]
 
     $bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($TargetVMPassword)
+    $body = $null
     try {
         $plainPassword = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
         $body = @{
@@ -1287,6 +1336,7 @@ function Set-MorpheusInstanceCredentials {
         } | ConvertTo-Json
     } finally {
         [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+        $plainPassword = $null
     }
 
     try {
@@ -1294,7 +1344,9 @@ function Set-MorpheusInstanceCredentials {
             -Method PUT -Headers $Headers -Body $body -ContentType 'application/json' | Out-Null
         Write-Log "Morpheus server $serverId credentials set to '$TargetVMUser'." -Level SUCCESS
     } catch {
-        Write-Log "Could not update credentials on server ${serverId}: $_ — finalize step may fail." -Level WARN
+        Write-Log "Could not update credentials on server ${serverId}: $($_.Exception.Message) — finalize step may fail." -Level WARN
+    } finally {
+        $body = $null
     }
 }
 
@@ -1515,7 +1567,12 @@ function Remove-VMwareToolsViaWinRM {
 
     try {
         Write-Log "Connecting to $TargetIP via WinRM to remove VMware Tools (timeout: $TimeoutMinutes min)..."
-        $sessionOpts = New-PSSessionOption -SkipCACheck -SkipCNCheck -SkipRevocationCheck
+        if ($WinRMSkipSSL) {
+            Write-Log "WinRMSkipSSL: TLS validation is DISABLED for WinRM sessions to $TargetIP." -Level WARN
+            $sessionOpts = New-PSSessionOption -SkipCACheck -SkipCNCheck -SkipRevocationCheck
+        } else {
+            $sessionOpts = New-PSSessionOption
+        }
         $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
         $session = $null
         while ((Get-Date) -lt $deadline -and -not $session) {
@@ -1523,7 +1580,7 @@ function Remove-VMwareToolsViaWinRM {
                 $session = New-PSSession -ComputerName $TargetIP -Port 5985 -Credential $cred `
                                -Authentication Negotiate -SessionOption $sessionOpts -ErrorAction Stop
             } catch {
-                Write-Log "WinRM not yet reachable at ${TargetIP}: $_ — retrying in 30s..." -Level WARN
+                Write-Log "WinRM not yet reachable at ${TargetIP}: $($_.Exception.Message) — retrying in 30s..." -Level WARN
                 Start-Sleep -Seconds 30
             }
         }
@@ -2139,7 +2196,7 @@ if ($MigrationOnly) {
             Write-Log 'Could not determine Morpheus instance ID — skipping post-migration VMware Tools removal.' -Level WARN
         }
     } catch {
-        Write-Log "FATAL ERROR: $_" -Level ERROR
+        Write-Log "FATAL ERROR: $($_.Exception.Message)" -Level ERROR
         if ($migrationAttempted) {
             if ($SkipRollbackRestart) {
                 Write-Log 'SkipRollbackRestart: leaving source VM powered off for troubleshooting.' -Level WARN
@@ -2154,7 +2211,7 @@ if ($MigrationOnly) {
                         Write-Log 'Source VM already powered on after migration failure.' -Level WARN
                     }
                 } catch {
-                    Write-Log "Could not restart source VM after migration failure: $_" -Level ERROR
+                    Write-Log "Could not restart source VM after migration failure: $($_.Exception.Message)" -Level ERROR
                 }
             }
         }
@@ -2341,19 +2398,19 @@ try {
     }
 }
 catch {
-    Write-Log "FATAL ERROR: $_" -Level ERROR
+    Write-Log "FATAL ERROR: $($_.Exception.Message)" -Level ERROR
     if ($null -ne $attachedDiskNumber -and -not $diskOfflined) {
         Write-Log "Cleanup: offlining attached helper disk number $attachedDiskNumber..." -Level WARN
         try {
             Disable-AttachedDiskOnHelper -HelperVM $helperVM -DiskNumber $attachedDiskNumber
         } catch {
-            Write-Log "Could not offline attached disk on helper VM: $_" -Level WARN
+            Write-Log "Could not offline attached disk on helper VM: $($_.Exception.Message)" -Level WARN
         }
     }
     if ($attachedDiskPath) {
         Write-Log "Cleanup: removing attached disk from helper VM..." -Level WARN
         try { Remove-TargetDiskFromHelper -HelperVM $helperVM -DiskPath $attachedDiskPath } catch {
-            Write-Log "Could not detach disk from helper VM: $_" -Level ERROR
+            Write-Log "Could not detach disk from helper VM: $($_.Exception.Message)" -Level ERROR
         }
     }
     if ($migrationAttempted) {
@@ -2370,14 +2427,14 @@ catch {
                     Write-Log "Source VM already powered on after migration failure." -Level WARN
                 }
             } catch {
-                Write-Log "Could not restart source VM after migration failure: $_" -Level ERROR
+                Write-Log "Could not restart source VM after migration failure: $($_.Exception.Message)" -Level ERROR
             }
         }
     }
     elseif (-not $vmStarted) {
         Write-Log "Attempting to restart target VM after failure..." -Level WARN
         try { Start-VM -VM $targetVM -Confirm:$false | Out-Null } catch {
-            Write-Log "Could not restart target VM: $_" -Level ERROR
+            Write-Log "Could not restart target VM: $($_.Exception.Message)" -Level ERROR
         }
     }
     throw

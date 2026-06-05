@@ -71,7 +71,7 @@ if ($KnownDiskNumbers) { ... }               # WRONG — @(0) is falsy
 ```
 
 ### Password handling
-Never accept raw strings without routing through `ConvertTo-SecurePassword`. The helper accepts `string | SecureString | PSCredential`.
+Never accept raw strings without routing through `ConvertTo-SecurePassword`. The helper accepts `string | SecureString | PSCredential` (parameter typed as `[object]` to allow all three).
 
 ---
 

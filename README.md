@@ -172,14 +172,18 @@ C:\Drivers\virtio-win\
 | `-DoNotEnableRDP` | Switch | No | Skip the automatic Remote Desktop enablement pre-migration. By default, the script enables RDP on the target VM via a VMware guest script before migration so the HVM instance is immediately accessible via Remote Desktop after cutover. |
 | `-TriggerMorpheusMigration` | Switch | No | Shuts down target VM after successful boot verify, then automates Morpheus HVM import. |
 | `-MorpheusServer` | String | No | FQDN or IP of the Morpheus / VM Essentials instance (no `https://`). |
-| `-MorpheusToken` | String | No | Morpheus API bearer token. |
+| `-MorpheusToken` | SecureString | No | Morpheus API bearer token. Pass as `(ConvertTo-SecureString "token" -AsPlainText -Force)` or from a secrets vault. |
 | `-MorpheusUser` | String | No | Morpheus username (used to fetch token if token parameter is absent). |
 | `-MorpheusPassword` | String | No | Morpheus password (used to fetch token if token parameter is absent). |
 | `-MorpheusTargetCloudId` | String | Auto-discover | Target HVM Cloud ID in Morpheus. Omit to select interactively from available clouds. |
 | `-MorpheusTargetPoolId` | String | Auto-discover | Target resource pool ID in Morpheus. Omit to select interactively (auto-selects if only one exists). |
 | `-MorpheusTargetNetworkId` | String | Auto-discover | Target Network ID in Morpheus. Omit to select interactively from networks in the target cloud. |
 | `-MorpheusTargetStoreId` | String | Auto-discover | Target Datastore ID in Morpheus. Omit to select interactively (displays free space). |
-| `-MorpheusSkipSSL` | Switch | No | Bypass self-signed SSL validation on the Morpheus endpoint. |
+| `-MorpheusSkipSSL` | Switch | No | Bypass TLS certificate validation on the Morpheus endpoint (for self-signed certs). |
+| `-VCSkipSSL` | Switch | No | Bypass TLS certificate validation for vCenter (for self-signed certs). Defaults to `Fail` if omitted. |
+| `-WinRMSkipSSL` | Switch | No | Bypass TLS certificate validation on WinRM sessions to migrated VMs. |
+| `-VCUser` | String | No | vCenter username. If omitted, PowerCLI uses ambient SSO credentials. |
+| `-VCPassword` | SecureString | No | vCenter password (used with `-VCUser`). |
 | `-MorpheusMigrationTimeoutHours` | Int | No | Max hours to wait for migration completion (Default: `4`). |
 | `-LogPath` | String | No | Path to write script logs on management host (Default: `C:\Windows\Logs\VirtIO-HelperInject`). |
 
@@ -198,8 +202,9 @@ Provide only credentials and switches. The script will query vCenter and Morpheu
   -TargetVMPassword "TargetPass!" `
   -TriggerMorpheusMigration `
   -MorpheusServer "morpheus.company.local" `
-  -MorpheusToken "a50c822e-1ff2-4b2a-8742-1e9a7e02df5b" `
-  -MorpheusSkipSSL
+  -MorpheusToken (ConvertTo-SecureString "a50c822e-1ff2-4b2a-8742-1e9a7e02df5b" -AsPlainText -Force) `
+  -MorpheusSkipSSL `
+  -VCSkipSSL
 ```
 
 ### 2. Basic Offline Injection Only (No Guest Tools)
@@ -245,7 +250,7 @@ This will inject the storage drivers offline, install all guest tools on boot, v
   -DeleteSnapshot `
   -TriggerMorpheusMigration `
   -MorpheusServer "morpheus.company.local" `
-  -MorpheusToken "a50c822e-1ff2-4b2a-8742-1e9a7e02df5b" `
+  -MorpheusToken (ConvertTo-SecureString "a50c822e-1ff2-4b2a-8742-1e9a7e02df5b" -AsPlainText -Force) `
   -MorpheusTargetCloudId "5" `
   -MorpheusTargetNetworkId "22" `
   -MorpheusSkipSSL

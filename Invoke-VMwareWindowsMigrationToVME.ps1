@@ -1122,6 +1122,18 @@ function Invoke-MorpheusMigration {
             $pct = if ($statusResp.migration.PSObject.Properties['percentComplete']) { $statusResp.migration.percentComplete } else { $null }
             $pctStr = if ($null -ne $pct) { " ($pct%)" } else { '' }
             Write-Log "Migration status: $status$pctStr"
+            # Best-effort: show vCenter task progress for the OVF export phase.
+            # The export is a vSphere-side operation tracked as a running task on the source VM.
+            if ($TargetVM -and (Get-Command Get-Task -ErrorAction SilentlyContinue)) {
+                try {
+                    $vcTask = Get-Task -ObjectType VirtualMachine -ErrorAction Stop |
+                        Where-Object { $_.ObjectId -eq $TargetVM.Id -and $_.State -eq 'Running' } |
+                        Select-Object -First 1
+                    if ($vcTask) {
+                        Write-Log "  vCenter task: $($vcTask.Name) — $($vcTask.PercentComplete)%"
+                    }
+                } catch { <# non-fatal: vCenter may not be reachable or no task running yet #> }
+            }
             switch ($status) {
                 'complete'  { $migrationDone = $true }
                 'completed' { $migrationDone = $true }

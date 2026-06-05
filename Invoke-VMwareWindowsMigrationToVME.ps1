@@ -1154,13 +1154,14 @@ function Invoke-MorpheusMigration {
             # The export is a vSphere-side operation tracked as a running task on the source VM.
             if ($TargetVM -and (Get-Command Get-Task -ErrorAction SilentlyContinue)) {
                 try {
-                    $vcTask = Get-Task -ObjectType VirtualMachine -ErrorAction Stop |
-                        Where-Object { $_.ObjectId -eq $TargetVM.Id -and $_.State -eq 'Running' } |
+                    # Scope directly to the VM to avoid loading all tasks (much faster)
+                    $vcTask = Get-Task -Entity $TargetVM -ErrorAction Stop |
+                        Where-Object { $_.State -eq 'Running' } |
                         Select-Object -First 1
                     if ($vcTask) {
                         Write-Log "  vCenter task: $($vcTask.Name) — $($vcTask.PercentComplete)%"
                     }
-                } catch { <# non-fatal: vCenter may not be reachable or no task running yet #> }
+                } catch { Write-Log "  vCenter task query skipped: $($_.Exception.Message)" -Level WARN }
             }
             switch ($status) {
                 'complete'  { $migrationDone = $true }

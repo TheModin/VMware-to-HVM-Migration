@@ -329,3 +329,16 @@ Logs are generated both on screen (with rich color coding) and appended to a tim
 ## Licensing & Contributions
 
 For licensing terms, see the [LICENSE](LICENSE.md) file. For advice on extending the script or contributing fixes, see the [CONTRIBUTING](CONTRIBUTING.md) guide. For help debugging execution issues, review the [TROUBLESHOOTING](TROUBLESHOOTING.md) guide.
+
+---
+
+## Architectural Decision Records
+
+Key design decisions are documented in the [`docs/adr/`](docs/adr/) directory:
+
+| ADR | Decision |
+| :--- | :--- |
+| [ADR-0001](docs/adr/adr-0001-helper-vm-offline-virtio-injection.md) | Helper VM offline VirtIO driver injection technique |
+| [ADR-0002](docs/adr/adr-0002-morpheus-404-success-polling.md) | Treating Morpheus 404 as migration success during plan polling |
+| [ADR-0003](docs/adr/adr-0003-securestring-credential-routing.md) | SecureString credential routing and `[object]`-typed VM password parameters |
+| [ADR-0004](docs/adr/adr-0004-monolith-vs-module-design.md) | Single-file monolith vs. multi-module script architecture |

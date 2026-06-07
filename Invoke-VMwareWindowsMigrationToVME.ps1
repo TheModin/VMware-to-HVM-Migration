@@ -773,8 +773,9 @@ Get-NetConnectionProfile | Set-NetConnectionProfile -NetworkCategory Private -Er
 # even if the new HVM network adapter is assigned a Public profile.
 New-NetFirewallRule -DisplayName 'WinRM HTTP' -Direction Inbound -Protocol TCP -LocalPort 5985 -Action Allow -Profile Any -ErrorAction SilentlyContinue
 New-NetFirewallRule -DisplayName 'WinRM HTTPS' -Direction Inbound -Protocol TCP -LocalPort 5986 -Action Allow -Profile Any -ErrorAction SilentlyContinue
-Set-WSManInstance -ResourceURI winrm/config/service/auth -ValueSet @{Negotiate=$true}
-Set-WSManInstance -ResourceURI winrm/config/service/auth -ValueSet @{Basic=$false}
+# Allow unencrypted HTTP transport so the management host can connect over plain HTTP.
+# Required when the connecting host uses Negotiate/NTLM over port 5985 without HTTPS.
+Set-Item WSMan:\localhost\Service\AllowUnencrypted -Value $true -ErrorAction SilentlyContinue
 Write-Host 'WINRM_ENABLED'
 '@
     try {
@@ -1652,6 +1653,12 @@ function Remove-VMwareToolsViaWinRM {
     $winrmUser = if ($TargetVMUser -match '[\\@]') { $TargetVMUser } else { ".\$TargetVMUser" }
     $cred = New-Object System.Management.Automation.PSCredential($winrmUser, $TargetVMPassword)
 
+    # Allow unencrypted HTTP transport on the client side. Required when the target VM
+    # was configured with AllowUnencrypted=true and we connect over port 5985 without HTTPS.
+    $clientAllowUnenc = 'WSMan:\localhost\Client\AllowUnencrypted'
+    $origClientAllowUnenc = (Get-Item $clientAllowUnenc -ErrorAction SilentlyContinue).Value
+    Set-Item $clientAllowUnenc -Value $true -Force -ErrorAction SilentlyContinue
+
     # Temporarily trust the target IP for Negotiate auth over HTTP.
     $trustedHostsPath = 'WSMan:\localhost\Client\TrustedHosts'
     $originalTrustedHosts = (Get-Item $trustedHostsPath).Value
@@ -1830,6 +1837,10 @@ function Remove-VMwareToolsViaWinRM {
         if ($trustedHostsModified) {
             Set-Item $trustedHostsPath -Value $originalTrustedHosts -Force
             Write-Log "Restored WSMan TrustedHosts to original value."
+        }
+        # Restore client AllowUnencrypted to its original value.
+        if ($null -ne $origClientAllowUnenc) {
+            Set-Item $clientAllowUnenc -Value $origClientAllowUnenc -Force -ErrorAction SilentlyContinue
         }
     }
 }

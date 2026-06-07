@@ -1646,7 +1646,11 @@ function Remove-VMwareToolsViaWinRM {
         [int]$TimeoutMinutes = 10
     )
 
-    $cred = New-Object System.Management.Automation.PSCredential($TargetVMUser, $TargetVMPassword)
+    # Normalize to local account format: on domain-joined VMs, bare "administrator" resolves
+    # to the DOMAIN account first, which fails if domain and local creds differ. Prefixing
+    # with ".\" forces Windows to authenticate against the local SAM database instead.
+    $winrmUser = if ($TargetVMUser -match '[\\@]') { $TargetVMUser } else { ".\$TargetVMUser" }
+    $cred = New-Object System.Management.Automation.PSCredential($winrmUser, $TargetVMPassword)
 
     # Temporarily trust the target IP for Negotiate auth over HTTP.
     $trustedHostsPath = 'WSMan:\localhost\Client\TrustedHosts'

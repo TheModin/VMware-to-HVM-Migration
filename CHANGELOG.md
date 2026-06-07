@@ -3,6 +3,43 @@
 All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.0] - 2026-06-07
+
+### Added
+
+- **Automatic reboot after VMware Tools removal** — after the uninstall task completes
+  with exit code 0 or 3010, `shutdown.exe /r /t 10` is issued inside the guest so the
+  VM reboots without manual intervention to complete the removal.
+- **vCenter OVF export progress in migration poll log** — while a Morpheus migration
+  plan is running, the script queries vCenter for any active task on the source VM and
+  logs its name and percentage (e.g. `ExportVm — 42%`) alongside each status line.
+
+### Fixed
+
+- Single-disk VMs (where `Get-HardDisk` returns an object rather than an array) caused
+  a "property Count cannot be found" error during disk candidate evaluation. `Get-HardDisk`
+  output is now always wrapped in `@()` to force array type.
+- Snapshot consolidation confirmation was case-sensitive (`YES` required). Changed to
+  case-insensitive so `yes`, `Yes`, and `YES` all confirm correctly.
+- When a VM has been previously migrated, Morpheus returns two server records (vCenter
+  + HVM cloud). The script now selects the record whose `externalId` matches the vSphere
+  moref format (`vm-\d+`), preventing SOAP faults from stale HVM-side records.
+- WinRM pre-migration setup now creates firewall rules scoped to **Profile Any** and sets
+  the network category to Private, ensuring WinRM remains reachable after migration to a
+  new HVM network adapter that Windows NLA may classify as Public.
+- `Set-MorpheusInstanceCredentials` is now called before `Install-MorpheusAgent` in the
+  `-PostMigrationOnly` path (it was already called in the full migration path). This
+  prevents the Morpheus agent install from failing silently due to stale cloud-default
+  credentials.
+- WinRM connections to migrated VMs from a domain-joined management host now use the
+  `.\<user>` local-account prefix, preventing NTLM from auto-qualifying the username
+  with the management host's domain and receiving `Access is denied` from workgroup VMs.
+- `Set-Item WSMan:\...\AllowUnencrypted` is now set to `true` on both the target VM
+  (pre-migration guest script) and the management host client before connecting, so plain
+  HTTP WinRM sessions are accepted. The client setting is restored in the `finally` block.
+- `Get-Task` call scoped to the source VM now uses pipeline input (`$TargetVM | Get-Task`)
+  instead of the `-Entity` parameter, which is not available in all PowerCLI versions.
+
 ## [1.0.0] - 2026-06-05
 
 ### Added
@@ -93,4 +130,5 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `Invoke-VMwareWindowsMigrationToVME.ps1` to reflect the full end-to-end scope of
   the tool.
 
+[1.1.0]: https://github.com/TheModin/VMware-to-HVM-Migration/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/TheModin/VMware-to-HVM-Migration/commits/main

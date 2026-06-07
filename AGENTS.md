@@ -75,6 +75,20 @@ if ($KnownDiskNumbers.Count -gt 0) { ... }   # correct
 if ($KnownDiskNumbers) { ... }               # WRONG — @(0) is falsy
 ```
 
+### WinRM management channel
+
+The post-migration WinRM path (`Remove-VMwareToolsViaWinRM`) connects from a **domain-joined management host** to a **workgroup target VM**. Several settings are required for this to work:
+
+| Requirement | Why | Where set |
+|-------------|-----|-----------|
+| `.\<user>` credential prefix | Bare `administrator` on a domain-joined client is NTLM-qualified as `DOMAIN\administrator`; the workgroup VM rejects it | `Remove-VMwareToolsViaWinRM` normalises `TargetVMUser` to `.\user` when no `\` or `@` is present |
+| `AllowUnencrypted = $true` on **target service** | Plain HTTP (port 5985) sessions are rejected without this on hardened Windows Server configs | Pre-migration guest script (`Enable-WinRMOnTarget`) runs `Set-Item WSMan:\localhost\Service\AllowUnencrypted -Value $true` |
+| `AllowUnencrypted = $true` on **client** | Client must also accept unencrypted transport | Set in `Remove-VMwareToolsViaWinRM` before `New-PSSession`; restored in `finally` |
+| Firewall rule **Profile Any** | Post-migration HVM NIC may be classified as Public by Windows NLA; Default WinRM rule only applies to Domain/Private | Pre-migration guest script creates `New-NetFirewallRule -Profile Any` for port 5985/5986 |
+| Target IP in `WSMan:\localhost\Client\TrustedHosts` | Required for Negotiate/NTLM over HTTP to a non-domain host | Added temporarily in `Remove-VMwareToolsViaWinRM`; restored in `finally` |
+
+Do **not** add `Set-WSManInstance -ResourceURI winrm/config/service/auth` restrictions (`Negotiate=$true`, `Basic=$false`) to the pre-migration guest script — these broke WinRM connectivity in testing.
+
 ### Password handling
 `HelperVMPassword` and `TargetVMPassword` are typed `[object]` and always routed through `ConvertTo-SecurePassword`, which accepts `string | SecureString | PSCredential`. Never accept raw strings for these without routing through that helper.
 
@@ -99,6 +113,17 @@ Reference: [Morpheus Migration API — addMigration](https://apidocs.morpheusdat
 | Poll execution via `GET /api/job-executions/{id}` | Output at `.jobExecution.process.output` or `.process.events[0].output` | Check both fields; status done = `success`/`error` |
 | PowerShell task type code is `winrmTask` (not `script`) | `script` = Shell/Bash; wrong type runs nothing on Windows | Always use `taskType: { code: 'winrmTask' }` for PS |
 | Script content goes in `file.content` (not `taskContent`) | `taskContent` is not a real API field — content silently ignored | Use `file: { sourceType: 'local', content: '...' }` |
+| `api/servers?name=X` returns **both** vCenter and HVM records when a VM has been migrated before | `Select-Object -First 1` may pick the stale HVM copy (externalId = VM name, not a moref) → Morpheus can't resolve the VM in vSphere → SOAP fault "object has already been deleted" | Prefer the record whose `externalId` matches `^vm-\d+$` (vSphere moref); fall back to zone name containing `vcenter`/`vmware` |
+| `POST /api/servers/{id}/install-agent` is unreliable in this environment | Returns immediately but `agentInstalled` stays `False` for 15+ min before timing out; root cause is Morpheus server → guest auth issue | Script times out after 15 min and falls back to direct WinRM; the WinRM path is the reliable production route |
+
+---
+
+## PowerCLI Quirks (learned from live testing)
+
+| Quirk | Impact | Handling in code |
+|-------|--------|-----------------|
+| `Get-Task -Entity <VM>` parameter not available in all PowerCLI versions | `A parameter cannot be found that matches parameter name 'Entity'` | Use pipeline input: `$TargetVM \| Get-Task` — works in all versions |
+| `Get-Task` without scoping loads **all tasks** across all VMs | Very slow in large vCenters; silently times out in the poll loop | Always scope via pipeline: `$TargetVM \| Get-Task` |
 
 ---
 

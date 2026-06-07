@@ -1155,8 +1155,8 @@ function Invoke-MorpheusMigration {
             # The export is a vSphere-side operation tracked as a running task on the source VM.
             if ($TargetVM -and (Get-Command Get-Task -ErrorAction SilentlyContinue)) {
                 try {
-                    # Scope directly to the VM to avoid loading all tasks (much faster)
-                    $vcTask = Get-Task -Entity $TargetVM -ErrorAction Stop |
+                    # Scope directly to the VM — pipe input supported in all PowerCLI versions
+                    $vcTask = $TargetVM | Get-Task -ErrorAction Stop |
                         Where-Object { $_.State -eq 'Running' } |
                         Select-Object -First 1
                     if ($vcTask) {

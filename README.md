@@ -39,7 +39,7 @@ The table below reflects real-world test results. Untested versions are expected
 | Windows Version | Migration Status | Notes |
 | :--- | :---: | :--- |
 | Windows Server 2025 | ✅ Tested | Full end-to-end migration verified |
-| Windows Server 2022 | ⚠️ Untested | Driver folder `2k22` present |
+| Windows Server 2022 | ✅ Tested | Full end-to-end migration verified |
 | Windows Server 2019 | ⚠️ Untested | Driver folder `2k19` present |
 | Windows Server 2016 | ⚠️ Untested | Driver folder `2k16` present |
 | Windows Server 2012 R2 | ⚠️ Untested | Driver folder `2k12R2` present |
